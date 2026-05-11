@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """External Envelope Tool
 
 Reads multiple Nastran .op2 or .h5 files (each may contain multiple subcases),
@@ -649,6 +650,17 @@ class LoadExtractionApp:
 
 
 if __name__ == '__main__':
-    root = tk.Tk()
-    app = LoadExtractionApp(root)
-    root.mainloop()
+    import traceback
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "envelope_error.txt")
+    try:
+        root = tk.Tk()
+        app = LoadExtractionApp(root)
+        root.mainloop()
+    except Exception:
+        err = traceback.format_exc()
+        with open(_log_path, "w", encoding="utf-8") as _f:
+            _f.write(err)
+        try:
+            messagebox.showerror("Başlatma Hatası", err)
+        except Exception:
+            pass
