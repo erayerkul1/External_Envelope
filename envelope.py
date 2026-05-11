@@ -50,12 +50,47 @@ RESULT_ATTRIBUTES: dict[str, tuple[str, ...]] = {
 CHECK_ON  = "☑"
 CHECK_OFF = "☐"
 
+
+class _ProgressTimer:
+    """Logs elapsed seconds every 5 s while a blocking operation runs."""
+
+    def __init__(self, log_fn, interval: int = 5):
+        self._log = log_fn
+        self._interval = interval
+        self._stop_evt = threading.Event()
+        self._t0 = 0.0
+
+    def start(self):
+        import time
+        self._t0 = time.time()
+        self._stop_evt.clear()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _run(self):
+        import time
+        while not self._stop_evt.wait(timeout=self._interval):
+            elapsed = int(time.time() - self._t0)
+            self._log(f"  ... hâlâ okunuyor ({elapsed}s geçti, lütfen bekleyin)")
+
+
 # ─── Backend ────────────────────────────────────────────────────────────────
 
-def _load_model(filepath: str) -> OP2:
+def _load_model(filepath: str, log_fn=None) -> OP2:
     model = OP2(debug=False, log=None)
     model.IS_TESTING = False
     ext = os.path.splitext(filepath)[1].lower()
+
+    # Show file size before the blocking read
+    try:
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        if log_fn:
+            log_fn(f"  Dosya boyutu: {size_mb:.1f} MB — okunuyor, lütfen bekleyin...")
+    except OSError:
+        pass
+
     if ext == ".op2":
         model.read_op2(filepath, combine=True)
     else:
@@ -63,7 +98,7 @@ def _load_model(filepath: str) -> OP2:
     return model
 
 
-def discover_results(filepaths: list[str]) -> dict:
+def discover_results(filepaths: list[str], log_fn=None) -> dict:
     """Scan files, return what result types are present.
 
     Returns
@@ -71,8 +106,12 @@ def discover_results(filepaths: list[str]) -> dict:
     {result_type: {"subcases": [(filepath, sc_id), ...], "n_files": int}}
     """
     discovered: dict = {}
-    for filepath in filepaths:
-        model = _load_model(filepath)
+    for i, filepath in enumerate(filepaths):
+        if log_fn:
+            log_fn(f"[{i+1}/{len(filepaths)}] Taranıyor: {os.path.basename(filepath)}")
+        model = _load_model(filepath, log_fn=log_fn)
+        if log_fn:
+            log_fn(f"  Dosya okundu. Result tipleri aranıyor...")
         for rt, attrs in RESULT_ATTRIBUTES.items():
             for attr in attrs:
                 rd = getattr(model, attr, {})
@@ -87,7 +126,8 @@ def discover_results(filepaths: list[str]) -> dict:
     return discovered
 
 
-def collect_raw(filepaths: list[str], selected_types: list[str]) -> dict:
+def collect_raw(filepaths: list[str], selected_types: list[str],
+                log_fn=None) -> dict:
     """Read files and collect raw pyNastran result objects.
 
     Returns
@@ -95,8 +135,12 @@ def collect_raw(filepaths: list[str], selected_types: list[str]) -> dict:
     {attr: [(filepath, sc_id, result_obj), ...]}
     """
     raw: dict = {}
-    for filepath in filepaths:
-        model = _load_model(filepath)
+    for i, filepath in enumerate(filepaths):
+        if log_fn:
+            log_fn(f"[{i+1}/{len(filepaths)}] Okunuyor: {os.path.basename(filepath)}")
+        model = _load_model(filepath, log_fn=log_fn)
+        if log_fn:
+            log_fn(f"  Dosya okundu. Seçili result tipleri yükleniyor...")
         for rt in selected_types:
             for attr in RESULT_ATTRIBUTES.get(rt, ()):
                 rd = getattr(model, attr, {})
@@ -104,6 +148,9 @@ def collect_raw(filepaths: list[str], selected_types: list[str]) -> dict:
                     continue
                 for sc_id, result_obj in rd.items():
                     raw.setdefault(attr, []).append((filepath, sc_id, result_obj))
+        if log_fn:
+            n = sum(len(v) for v in raw.values())
+            log_fn(f"  Toplam {n} subcase yüklendi.")
     return raw
 
 
@@ -488,13 +535,17 @@ class LoadExtractionApp:
                           daemon=True).start()
 
     def _worker_scan(self, files: list[str]):
+        timer = _ProgressTimer(self._log)
         try:
             self._log(f"{len(files)} dosya taranıyor...")
-            discovered = discover_results(files)
+            timer.start()
+            discovered = discover_results(files, log_fn=self._log)
+            timer.stop()
             self._discovered = discovered
             self.root.after(0, lambda: self._populate_results_tree(discovered))
             self._log(f"{len(discovered)} result tipi bulundu.")
         except Exception:
+            timer.stop()
             err = traceback.format_exc()
             self._log(f"HATA:\n{err}")
             self.root.after(0, lambda: messagebox.showerror("Tarama Hatası", err))
@@ -552,10 +603,13 @@ class LoadExtractionApp:
         ).start()
 
     def _worker_run(self, files, selected_types, output_path, fmt, excel_path):
+        timer = _ProgressTimer(self._log)
         try:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
             self._log(f"{len(files)} dosyadan veri okunuyor...")
-            raw = collect_raw(files, selected_types)
+            timer.start()
+            raw = collect_raw(files, selected_types, log_fn=self._log)
+            timer.stop()
 
             if not raw:
                 self.root.after(0, lambda: messagebox.showerror(
@@ -586,6 +640,7 @@ class LoadExtractionApp:
             ))
 
         except Exception:
+            timer.stop()
             err = traceback.format_exc()
             self._log(f"HATA:\n{err}")
             self.root.after(0, lambda: messagebox.showerror("Hata", err))
