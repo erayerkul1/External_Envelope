@@ -54,7 +54,7 @@ CHECK_OFF = "☐"
 class _ProgressTimer:
     """Logs elapsed seconds every 5 s while a blocking operation runs."""
 
-    def __init__(self, log_fn, interval: int = 5):
+    def __init__(self, log_fn, interval: int = 30):
         self._log = log_fn
         self._interval = interval
         self._stop_evt = threading.Event()
