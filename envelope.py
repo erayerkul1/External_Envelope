@@ -266,16 +266,12 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
         res_max = deepcopy(template)
         res_max.data = max_arr[np.newaxis, :, :]   # (1, nelems, ncomp)
 
-        res_min = deepcopy(template)
-        res_min.data = min_arr[np.newaxis, :, :]
-
         try:
             res_max.isubcase = 1
-            res_min.isubcase = 2
         except Exception:
             pass
 
-        setattr(out_model, attr, {1: res_max, 2: res_min})
+        setattr(out_model, attr, {1: res_max})
 
     if fmt == "op2":
         out_model.write_op2(output_path, nastran_format=nastran_format)
