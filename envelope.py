@@ -19,6 +19,9 @@ python envelope.py a.op2 b.op2 --format csv --export-envelope envelope.csv \\
 import argparse
 import os
 import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -369,5 +372,261 @@ def main(argv=None):
     print("Done.")
 
 
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class LoadExtractionApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("External Envelope Tool")
+        self.root.resizable(True, True)
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        pad = {"padx": 6, "pady": 4}
+
+        # ── Input files ────────────────────────────────────────────────
+        frm_files = ttk.LabelFrame(self.root, text="Giriş Dosyaları (.op2 / .h5)")
+        frm_files.pack(fill="both", expand=False, **pad)
+
+        self.lb_files = tk.Listbox(frm_files, selectmode=tk.EXTENDED, height=5, width=70)
+        self.lb_files.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+
+        sb_files = ttk.Scrollbar(frm_files, orient="vertical", command=self.lb_files.yview)
+        sb_files.pack(side="left", fill="y", pady=4)
+        self.lb_files.configure(yscrollcommand=sb_files.set)
+
+        frm_file_btns = ttk.Frame(frm_files)
+        frm_file_btns.pack(side="left", padx=4, pady=4, anchor="n")
+        ttk.Button(frm_file_btns, text="Ekle",   width=10, command=self._add_files).pack(pady=2)
+        ttk.Button(frm_file_btns, text="Kaldır", width=10, command=self._remove_files).pack(pady=2)
+
+        # ── Result types ───────────────────────────────────────────────
+        frm_types = ttk.LabelFrame(self.root, text="Result Tipleri")
+        frm_types.pack(fill="both", expand=False, **pad)
+
+        self._type_vars: Dict[str, tk.BooleanVar] = {}
+        grid_frame = ttk.Frame(frm_types)
+        grid_frame.pack(fill="x", padx=4, pady=2)
+
+        cols = 4
+        for i, rt in enumerate(sorted(RESULT_ATTRIBUTES.keys())):
+            var = tk.BooleanVar(value=True)
+            self._type_vars[rt] = var
+            ttk.Checkbutton(grid_frame, text=rt, variable=var).grid(
+                row=i // cols, column=i % cols, sticky="w", padx=4, pady=1
+            )
+
+        frm_type_btns = ttk.Frame(frm_types)
+        frm_type_btns.pack(anchor="w", padx=4, pady=(0, 4))
+        ttk.Button(frm_type_btns, text="Tümünü Seç",    command=lambda: self._set_all_types(True)).pack(side="left", padx=2)
+        ttk.Button(frm_type_btns, text="Tümünü Kaldır", command=lambda: self._set_all_types(False)).pack(side="left", padx=2)
+
+        # ── Envelope output ────────────────────────────────────────────
+        frm_out = ttk.LabelFrame(self.root, text="Envelope Çıktısı")
+        frm_out.pack(fill="x", **pad)
+
+        frm_env_path = ttk.Frame(frm_out)
+        frm_env_path.pack(fill="x", padx=4, pady=2)
+        ttk.Label(frm_env_path, text="Dosya:").pack(side="left")
+        self.sv_envelope = tk.StringVar()
+        ttk.Entry(frm_env_path, textvariable=self.sv_envelope, width=55).pack(side="left", padx=4)
+        ttk.Button(frm_env_path, text="Gözat", command=self._browse_envelope).pack(side="left")
+
+        frm_fmt = ttk.Frame(frm_out)
+        frm_fmt.pack(anchor="w", padx=4, pady=(0, 4))
+        ttk.Label(frm_fmt, text="Format:").pack(side="left")
+        self.sv_format = tk.StringVar(value="xlsx")
+        ttk.Radiobutton(frm_fmt, text="xlsx", variable=self.sv_format, value="xlsx").pack(side="left", padx=4)
+        ttk.Radiobutton(frm_fmt, text="csv",  variable=self.sv_format, value="csv").pack(side="left")
+
+        # ── Governing report ───────────────────────────────────────────
+        frm_gov = ttk.LabelFrame(self.root, text="Governing Subcase Raporu (opsiyonel)")
+        frm_gov.pack(fill="x", **pad)
+
+        self.bv_governing = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_gov, text="Governing raporu oluştur",
+                        variable=self.bv_governing,
+                        command=self._toggle_governing).pack(anchor="w", padx=4, pady=2)
+
+        frm_gov_path = ttk.Frame(frm_gov)
+        frm_gov_path.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(frm_gov_path, text="Dosya:").pack(side="left")
+        self.sv_governing = tk.StringVar()
+        self.ent_governing = ttk.Entry(frm_gov_path, textvariable=self.sv_governing, width=55, state="disabled")
+        self.ent_governing.pack(side="left", padx=4)
+        self.btn_gov_browse = ttk.Button(frm_gov_path, text="Gözat",
+                                         command=self._browse_governing, state="disabled")
+        self.btn_gov_browse.pack(side="left")
+
+        # ── Run button ─────────────────────────────────────────────────
+        self.btn_run = ttk.Button(self.root, text="Envelope Hesapla",
+                                  command=self._run, style="Accent.TButton")
+        self.btn_run.pack(fill="x", padx=8, pady=6)
+
+        # ── Log ────────────────────────────────────────────────────────
+        frm_log = ttk.LabelFrame(self.root, text="Log")
+        frm_log.pack(fill="both", expand=True, **pad)
+
+        self.log = scrolledtext.ScrolledText(frm_log, height=10, state="disabled",
+                                              wrap="word", font=("Courier", 9))
+        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str):
+        """Append a line to the log widget (thread-safe)."""
+        def _append():
+            self.log.configure(state="normal")
+            self.log.insert("end", msg + "\n")
+            self.log.see("end")
+            self.log.configure(state="disabled")
+        self.root.after(0, _append)
+
+    def _add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Nastran dosyaları seç",
+            filetypes=[("Nastran files", "*.op2 *.h5 *.hdf5"), ("All files", "*.*")],
+        )
+        existing = list(self.lb_files.get(0, "end"))
+        for p in paths:
+            if p not in existing:
+                self.lb_files.insert("end", p)
+
+    def _remove_files(self):
+        for idx in reversed(self.lb_files.curselection()):
+            self.lb_files.delete(idx)
+
+    def _set_all_types(self, state: bool):
+        for var in self._type_vars.values():
+            var.set(state)
+
+    def _browse_envelope(self):
+        fmt = self.sv_format.get()
+        ext = ".xlsx" if fmt == "xlsx" else ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Envelope çıktı dosyası",
+            defaultextension=ext,
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("All", "*.*")],
+        )
+        if path:
+            self.sv_envelope.set(path)
+
+    def _browse_governing(self):
+        fmt = self.sv_format.get()
+        ext = ".xlsx" if fmt == "xlsx" else ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Governing rapor dosyası",
+            defaultextension=ext,
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("All", "*.*")],
+        )
+        if path:
+            self.sv_governing.set(path)
+
+    def _toggle_governing(self):
+        state = "normal" if self.bv_governing.get() else "disabled"
+        self.ent_governing.configure(state=state)
+        self.btn_gov_browse.configure(state=state)
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+
+    def _run(self):
+        input_files = list(self.lb_files.get(0, "end"))
+        if not input_files:
+            messagebox.showwarning("Eksik giriş", "Lütfen en az bir dosya ekleyin.")
+            return
+
+        selected_types = [rt for rt, var in self._type_vars.items() if var.get()]
+        if not selected_types:
+            messagebox.showwarning("Eksik seçim", "Lütfen en az bir result tipi seçin.")
+            return
+
+        envelope_path = self.sv_envelope.get().strip()
+        if not envelope_path:
+            messagebox.showwarning("Eksik yol", "Envelope çıktı dosyası belirtin.")
+            return
+
+        governing_path = None
+        if self.bv_governing.get():
+            governing_path = self.sv_governing.get().strip()
+            if not governing_path:
+                messagebox.showwarning("Eksik yol", "Governing rapor dosyası belirtin.")
+                return
+
+        fmt = self.sv_format.get()
+
+        # Clear log
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+        self.btn_run.configure(state="disabled")
+        threading.Thread(
+            target=self._worker,
+            args=(input_files, selected_types, envelope_path, governing_path, fmt),
+            daemon=True,
+        ).start()
+
+    def _worker(self, input_files, selected_types, envelope_path, governing_path, fmt):
+        try:
+            self._log(f"{len(input_files)} dosya okunuyor...")
+            all_results = read_files(input_files, requested_types=selected_types)
+
+            if not all_results:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Sonuç yok",
+                    "Dosyalarda seçilen result tipleri bulunamadı."
+                ))
+                return
+
+            self._log(f"{len(all_results)} subcase bulundu:")
+            for (fp, sc), type_dict in all_results.items():
+                self._log(f"  {os.path.basename(fp)}  subcase {sc}: {list(type_dict.keys())}")
+
+            self._log("\nEnvelope hesaplanıyor...")
+            envelope_max, envelope_min = compute_envelope(all_results)
+
+            governing = None
+            if governing_path:
+                self._log("Governing raporu oluşturuluyor...")
+                governing = build_governing_report(all_results)
+
+            self._log(f"\nDosyaya yazılıyor → {envelope_path}")
+            export_results(
+                envelope_max=envelope_max,
+                envelope_min=envelope_min,
+                output_path=envelope_path,
+                fmt=fmt,
+                governing=governing,
+                governing_path=governing_path,
+            )
+            if governing_path:
+                self._log(f"Governing raporu → {governing_path}")
+
+            self._log("\nTamamlandı.")
+            self.root.after(0, lambda: messagebox.showinfo("Tamamlandı", "Envelope başarıyla oluşturuldu."))
+
+        except Exception as exc:
+            self._log(f"\nHATA: {exc}")
+            self.root.after(0, lambda: messagebox.showerror("Hata", str(exc)))
+        finally:
+            self.root.after(0, lambda: self.btn_run.configure(state="normal"))
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        main()
+    else:
+        root = tk.Tk()
+        app = LoadExtractionApp(root)
+        root.mainloop()
