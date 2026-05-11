@@ -1,41 +1,22 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-"""External Envelope Tool
 
-Reads multiple Nastran .op2 or .h5 files (each may contain multiple subcases),
-computes element/node-wise max and min envelope across all subcases, and
-exports the results to Excel or CSV.
-
-Usage examples
---------------
-python envelope.py results1.op2 results2.h5 --export-envelope envelope.xlsx
-
-python envelope.py a.op2 b.op2 --result-types displacements plate_stress \\
-    --export-envelope envelope.xlsx --export-governing governing.xlsx
-
-python envelope.py a.op2 b.op2 --format csv --export-envelope envelope.csv \\
-    --export-governing governing.csv
-"""
-
-import argparse
 import os
 import sys
 import threading
+import traceback
 import tkinter as tk
+from copy import deepcopy
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from typing import Dict, Tuple
 
-# Heavy dependencies are imported lazily inside functions so that a missing
-# package shows a proper error dialog instead of silently crashing on
-# double-click. Top-level names are set to None and resolved on first use.
 try:
+    import numpy as np
     import pandas as pd
     from pyNastran.op2.op2 import OP2
     _DEPS_OK = True
     _DEPS_ERR = ""
 except ImportError as _e:
-    pd = None  # type: ignore
-    OP2 = None  # type: ignore
+    np = pd = OP2 = None  # type: ignore
     _DEPS_OK = False
     _DEPS_ERR = (
         f"Gerekli kütüphane(ler) yüklü değil:\n{_e}\n\n"
@@ -43,11 +24,9 @@ except ImportError as _e:
         "  pip install -r requirements.txt"
     )
 
-# ---------------------------------------------------------------------------
-# Result type definitions
-# ---------------------------------------------------------------------------
+# ─── Result type → pyNastran attribute(s) ───────────────────────────────────
 
-RESULT_ATTRIBUTES: Dict[str, Tuple[str, ...]] = {
+RESULT_ATTRIBUTES: dict[str, tuple[str, ...]] = {
     "displacements":  ("displacements",),
     "velocities":     ("velocities",),
     "accelerations":  ("accelerations",),
@@ -68,331 +47,191 @@ RESULT_ATTRIBUTES: Dict[str, Tuple[str, ...]] = {
     "beam_force":     ("cbeam_force",),
 }
 
-_ID_COLS = {"element_id", "node_id", "nid", "eid", "elementid", "nodeid"}
+CHECK_ON  = "☑"
+CHECK_OFF = "☐"
 
-# ---------------------------------------------------------------------------
-# Reading
-# ---------------------------------------------------------------------------
+# ─── Backend ────────────────────────────────────────────────────────────────
 
-def read_files(
-    filepaths: list,
-    requested_types: list = None,
-) -> Dict[Tuple[str, int], Dict]:
-    """Read one or more .op2 / .h5 files.
+def _load_model(filepath: str) -> OP2:
+    model = OP2(debug=False, log=None)
+    model.IS_TESTING = False
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".op2":
+        model.read_op2(filepath, combine=True)
+    else:
+        model.load_hdf5_filename(filepath)
+    return model
 
-    Returns {(filepath, subcase_id): {result_type: DataFrame}}
+
+def discover_results(filepaths: list[str]) -> dict:
+    """Scan files, return what result types are present.
+
+    Returns
+    -------
+    {result_type: {"subcases": [(filepath, sc_id), ...], "n_files": int}}
     """
-    if not _DEPS_OK:
-        raise RuntimeError(_DEPS_ERR)
-    types_to_read = requested_types or list(RESULT_ATTRIBUTES.keys())
-    combined: Dict[Tuple[str, int], Dict[str, pd.DataFrame]] = {}
-
+    discovered: dict = {}
     for filepath in filepaths:
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext not in (".op2", ".h5", ".hdf5"):
-            raise ValueError(f"Unsupported file extension: {ext}  (expected .op2 or .h5/.hdf5)")
-
-        model = OP2(debug=False, log=None)
-        model.IS_TESTING = False
-
-        if ext == ".op2":
-            model.read_op2(filepath, combine=True)
-        else:
-            model.load_hdf5_filename(filepath)
-
-        for result_type in types_to_read:
-            for attr in RESULT_ATTRIBUTES[result_type]:
-                result_dict = getattr(model, attr, {})
-                if not result_dict:
+        model = _load_model(filepath)
+        for rt, attrs in RESULT_ATTRIBUTES.items():
+            for attr in attrs:
+                rd = getattr(model, attr, {})
+                if not rd:
                     continue
-                for subcase_id, result_obj in result_dict.items():
-                    try:
-                        df = result_obj.to_dataframe()
-                    except Exception:
-                        continue
-                    if df.empty:
-                        continue
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = ["_".join(str(c) for c in col).strip("_") for col in df.columns]
-                    df = df.reset_index()
-                    key = (filepath, subcase_id)
-                    if key not in combined:
-                        combined[key] = {}
-                    if result_type in combined[key]:
-                        combined[key][result_type] = pd.concat(
-                            [combined[key][result_type], df], ignore_index=True
-                        )
-                    else:
-                        combined[key][result_type] = df
-
-    return combined
-
-# ---------------------------------------------------------------------------
-# Envelope computation
-# ---------------------------------------------------------------------------
-
-def _id_column(df: pd.DataFrame) -> str | None:
-    for col in df.columns:
-        if col.lower() in _ID_COLS:
-            return col
-    if not df.empty and pd.api.types.is_integer_dtype(df.iloc[:, 0]):
-        return df.columns[0]
-    return None
+                entry = discovered.setdefault(rt, {"subcases": [], "_files": set()})
+                for sc_id in rd:
+                    entry["subcases"].append((filepath, sc_id))
+                entry["_files"].add(filepath)
+    for rt in discovered:
+        discovered[rt]["n_files"] = len(discovered[rt].pop("_files"))
+    return discovered
 
 
-def _numeric_cols(df: pd.DataFrame, id_col: str) -> list:
-    return [c for c in df.columns if c != id_col and pd.api.types.is_numeric_dtype(df[c])]
+def collect_raw(filepaths: list[str], selected_types: list[str]) -> dict:
+    """Read files and collect raw pyNastran result objects.
+
+    Returns
+    -------
+    {attr: [(filepath, sc_id, result_obj), ...]}
+    """
+    raw: dict = {}
+    for filepath in filepaths:
+        model = _load_model(filepath)
+        for rt in selected_types:
+            for attr in RESULT_ATTRIBUTES.get(rt, ()):
+                rd = getattr(model, attr, {})
+                if not rd:
+                    continue
+                for sc_id, result_obj in rd.items():
+                    raw.setdefault(attr, []).append((filepath, sc_id, result_obj))
+    return raw
 
 
-def compute_envelope(
-    all_results: Dict[Tuple[str, int], Dict[str, pd.DataFrame]],
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-    """Return (envelope_max, envelope_min) dicts keyed by result_type."""
-    all_types: set = set()
-    for type_dict in all_results.values():
-        all_types.update(type_dict.keys())
+def _get_ids(result_obj) -> list:
+    """Extract element or node IDs from a result object."""
+    try:
+        if hasattr(result_obj, "node_gridtype"):
+            return result_obj.node_gridtype[:, 0].tolist()
+        if hasattr(result_obj, "element_node"):
+            return result_obj.element_node[:, 0].tolist()
+        if hasattr(result_obj, "element"):
+            return result_obj.element.tolist()
+    except Exception:
+        pass
+    return list(range(result_obj.data.shape[1]))
 
-    envelope_max: Dict[str, pd.DataFrame] = {}
-    envelope_min: Dict[str, pd.DataFrame] = {}
 
-    for result_type in sorted(all_types):
-        frames = []
-        for (filepath, subcase_id), type_dict in all_results.items():
-            if result_type not in type_dict:
-                continue
-            df = type_dict[result_type].copy()
-            df["__file__"] = filepath
-            df["__subcase__"] = subcase_id
-            frames.append(df)
+def compute_envelope(raw: dict) -> tuple:
+    """Compute element-wise max and min across all subcases.
 
-        if not frames:
+    Returns
+    -------
+    env_max   : {attr: ndarray (nelems, ncomp)}
+    env_min   : {attr: ndarray (nelems, ncomp)}
+    governing : {attr: {"max": [(file, sc), ...], "min": [(file, sc), ...]}}
+                 indexed by element position
+    templates : {attr: result_obj}   — used as template for output writing
+    elem_ids  : {attr: [int, ...]}
+    """
+    env_max: dict = {}
+    env_min: dict = {}
+    governing: dict = {}
+    templates: dict = {}
+    elem_ids: dict = {}
+
+    for attr, entries in raw.items():
+        if not entries:
             continue
 
-        combined = pd.concat(frames, ignore_index=True)
-        id_col = _id_column(combined)
-        if id_col is None:
-            continue
-        num_cols = _numeric_cols(combined, id_col)
-        if not num_cols:
-            continue
+        # result_obj.data shape: (ntimes, nelems, ncomp)
+        # For static analysis ntimes == 1; use last time step for others.
+        arrays = [e[2].data[-1] for e in entries]  # list of (nelems, ncomp)
 
-        max_rows, min_rows = [], []
+        try:
+            stacked = np.stack(arrays, axis=0)  # (n_sc, nelems, ncomp)
+        except ValueError:
+            continue  # inconsistent shapes — skip
 
-        for elem_id, group in combined.groupby(id_col):
-            max_row = {id_col: elem_id}
-            min_row = {id_col: elem_id}
+        env_max[attr] = stacked.max(axis=0)
+        env_min[attr] = stacked.min(axis=0)
 
-            for col in num_cols:
-                vals = group[col]
-                max_row[col] = vals[vals.idxmax()]
-                min_row[col] = vals[vals.idxmin()]
+        # Governing: which subcase yields max / min absolute sum per element
+        abs_sum     = np.abs(stacked).sum(axis=2)   # (n_sc, nelems)
+        gov_max_idx = abs_sum.argmax(axis=0)         # (nelems,)
+        gov_min_idx = abs_sum.argmin(axis=0)
 
-            abs_sums = group[num_cols].abs().sum(axis=1)
-            max_row["governing_file"]     = group.loc[abs_sums.idxmax(), "__file__"]
-            max_row["governing_subcase"]  = group.loc[abs_sums.idxmax(), "__subcase__"]
-            min_row["governing_file"]     = group.loc[abs_sums.idxmin(), "__file__"]
-            min_row["governing_subcase"]  = group.loc[abs_sums.idxmin(), "__subcase__"]
+        governing[attr] = {
+            "max": [(entries[i][0], entries[i][1]) for i in gov_max_idx],
+            "min": [(entries[i][0], entries[i][1]) for i in gov_min_idx],
+        }
+        templates[attr] = entries[0][2]
+        elem_ids[attr]  = _get_ids(entries[0][2])
 
-            max_rows.append(max_row)
-            min_rows.append(min_row)
-
-        envelope_max[result_type] = pd.DataFrame(max_rows)
-        envelope_min[result_type] = pd.DataFrame(min_rows)
-
-    return envelope_max, envelope_min
+    return env_max, env_min, governing, templates, elem_ids
 
 
-def build_governing_report(
-    all_results: Dict[Tuple[str, int], Dict[str, pd.DataFrame]],
-) -> Dict[str, pd.DataFrame]:
-    """For every element × result column, record which file/subcase governs max and min."""
-    all_types: set = set()
-    for type_dict in all_results.values():
-        all_types.update(type_dict.keys())
+def write_output(env_max: dict, env_min: dict, templates: dict,
+                 output_path: str, fmt: str) -> None:
+    """Write envelope as .op2 or .h5.
 
-    report: Dict[str, pd.DataFrame] = {}
+    Subcase 1 = MAX envelope, Subcase 2 = MIN envelope.
+    Uses deepcopy of template result objects so the original data is preserved.
+    """
+    out_model = OP2(debug=False, log=None)
+    out_model.IS_TESTING = False
 
-    for result_type in sorted(all_types):
-        frames = []
-        for (filepath, subcase_id), type_dict in all_results.items():
-            if result_type not in type_dict:
-                continue
-            df = type_dict[result_type].copy()
-            df["__file__"] = filepath
-            df["__subcase__"] = subcase_id
-            frames.append(df)
+    for attr, max_arr in env_max.items():
+        min_arr  = env_min[attr]
+        template = templates[attr]
 
-        if not frames:
-            continue
+        res_max = deepcopy(template)
+        res_max.data = max_arr[np.newaxis, :, :]   # (1, nelems, ncomp)
 
-        combined = pd.concat(frames, ignore_index=True)
-        id_col = _id_column(combined)
-        if id_col is None:
-            continue
-        num_cols = _numeric_cols(combined, id_col)
-        if not num_cols:
-            continue
+        res_min = deepcopy(template)
+        res_min.data = min_arr[np.newaxis, :, :]
 
-        rows = []
-        for elem_id, group in combined.groupby(id_col):
-            for col in num_cols:
-                vals = group[col]
-                max_idx = vals.idxmax()
-                min_idx = vals.idxmin()
-                rows.append({
-                    id_col:                   elem_id,
-                    "result_column":          col,
-                    "max_value":              vals[max_idx],
-                    "max_governing_file":     os.path.basename(group.loc[max_idx, "__file__"]),
-                    "max_governing_subcase":  group.loc[max_idx, "__subcase__"],
-                    "min_value":              vals[min_idx],
-                    "min_governing_file":     os.path.basename(group.loc[min_idx, "__file__"]),
-                    "min_governing_subcase":  group.loc[min_idx, "__subcase__"],
-                })
+        try:
+            res_max.isubcase = 1
+            res_min.isubcase = 2
+        except Exception:
+            pass
 
-        report[result_type] = pd.DataFrame(rows)
+        setattr(out_model, attr, {1: res_max, 2: res_min})
 
-    return report
+    if fmt == "op2":
+        out_model.write_op2(output_path)
+    else:
+        out_model.export_hdf5(output_path)
 
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
 
-def _write_excel(data: Dict[str, pd.DataFrame], path: str) -> None:
+def build_governing_df(governing: dict, elem_ids: dict) -> pd.DataFrame:
+    rows = []
+    for attr, gov in governing.items():
+        ids = elem_ids.get(attr, list(range(len(gov["max"]))))
+        for i, eid in enumerate(ids):
+            max_file, max_sc = gov["max"][i]
+            min_file, min_sc = gov["min"][i]
+            rows.append({
+                "Result_Type":       attr,
+                "Element/Node_ID":   int(eid),
+                "Max_Gov_File":      os.path.basename(max_file),
+                "Max_Gov_Subcase":   max_sc,
+                "Min_Gov_File":      os.path.basename(min_file),
+                "Min_Gov_Subcase":   min_sc,
+            })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def export_governing_excel(df: pd.DataFrame, path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for sheet, df in data.items():
-            df.to_excel(writer, sheet_name=sheet[:31], index=False)
-
-
-def _write_csv(data: Dict[str, pd.DataFrame], base_path: str, suffix: str = "") -> None:
-    base = os.path.splitext(base_path)[0]
-    os.makedirs(os.path.dirname(os.path.abspath(base_path)), exist_ok=True)
-    for key, df in data.items():
-        df.to_csv(f"{base}_{key}{suffix}.csv", index=False)
-
-
-def export_results(
-    envelope_max: Dict[str, pd.DataFrame],
-    envelope_min: Dict[str, pd.DataFrame],
-    output_path: str,
-    fmt: str = "xlsx",
-    governing: Dict[str, pd.DataFrame] | None = None,
-    governing_path: str | None = None,
-) -> None:
-    if fmt == "xlsx":
-        combined = {f"{rt}_MAX": df for rt, df in envelope_max.items()}
-        combined.update({f"{rt}_MIN": df for rt, df in envelope_min.items()})
-        _write_excel(combined, output_path)
-        if governing and governing_path:
-            _write_excel(governing, governing_path)
-    else:
-        _write_csv(envelope_max, output_path, "_max")
-        _write_csv(envelope_min, output_path, "_min")
-        if governing and governing_path:
-            _write_csv(governing, governing_path, "_governing")
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description=(
-            "Create an envelope (worst-case max/min) from multiple Nastran "
-            ".op2 or .h5 analysis output files."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "input_files", nargs="+", metavar="FILE",
-        help=".op2 or .h5/.hdf5 Nastran result files (one or more)",
-    )
-    parser.add_argument(
-        "--result-types", nargs="+", metavar="TYPE", default=None,
-        help=(
-            "Result types to include. Default: all available. "
-            f"Choices: {', '.join(sorted(RESULT_ATTRIBUTES.keys()))}"
-        ),
-    )
-    parser.add_argument(
-        "--export-envelope", metavar="PATH", required=True,
-        help="Output file for envelope results (.xlsx or .csv)",
-    )
-    parser.add_argument(
-        "--export-governing", metavar="PATH", default=None,
-        help=(
-            "Optional output file for the governing-subcase report (.xlsx or .csv). "
-            "Shows which file/subcase governs each element for each result column."
-        ),
-    )
-    parser.add_argument(
-        "--format", choices=["xlsx", "csv"], default="xlsx",
-        help="Output format (default: xlsx)",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-
-    if args.result_types:
-        invalid = [t for t in args.result_types if t not in RESULT_ATTRIBUTES]
-        if invalid:
-            print(
-                f"ERROR: Unknown result type(s): {invalid}\n"
-                f"Available: {sorted(RESULT_ATTRIBUTES.keys())}",
-                file=sys.stderr,
+        df.to_excel(writer, sheet_name="Tümü", index=False)
+        for rt in df["Result_Type"].unique():
+            df[df["Result_Type"] == rt].to_excel(
+                writer, sheet_name=rt[:31], index=False
             )
-            sys.exit(1)
 
-    print(f"Reading {len(args.input_files)} file(s)...")
-    try:
-        all_results = read_files(args.input_files, requested_types=args.result_types)
-    except Exception as exc:
-        print(f"ERROR while reading files: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    if not all_results:
-        print(
-            "No results found in the provided files. "
-            "Check that the files contain the requested result types.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    print(f"Found {len(all_results)} subcase(s) across all files:")
-    for (filepath, subcase_id), type_dict in all_results.items():
-        print(f"  {filepath}  subcase {subcase_id}: {list(type_dict.keys())}")
-
-    print("\nComputing envelope...")
-    envelope_max, envelope_min = compute_envelope(all_results)
-
-    governing = None
-    if args.export_governing:
-        print("Building governing-subcase report...")
-        governing = build_governing_report(all_results)
-
-    print(f"\nExporting envelope → {args.export_envelope}")
-    export_results(
-        envelope_max=envelope_max,
-        envelope_min=envelope_min,
-        output_path=args.export_envelope,
-        fmt=args.format,
-        governing=governing,
-        governing_path=args.export_governing,
-    )
-
-    if args.export_governing:
-        print(f"Exporting governing report → {args.export_governing}")
-
-    print("Done.")
-
-
-# ---------------------------------------------------------------------------
-# GUI
-# ---------------------------------------------------------------------------
+# ─── GUI ────────────────────────────────────────────────────────────────────
 
 class LoadExtractionApp:
     def __init__(self, root: tk.Tk):
@@ -400,109 +239,158 @@ class LoadExtractionApp:
         self.root.title("External Envelope Tool")
         self.root.resizable(True, True)
 
+        self._discovered: dict = {}
+        self._check_states: dict = {}   # {treeview_iid: bool}
+
         self._build_ui()
 
         if not _DEPS_OK:
             messagebox.showerror("Eksik Kütüphane", _DEPS_ERR)
+            self.btn_scan.configure(state="disabled")
             self.btn_run.configure(state="disabled")
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ── UI construction ─────────────────────────────────────────────────────
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
-        # ── Input files ────────────────────────────────────────────────
+        # ── Giriş dosyaları ──────────────────────────────────────────
         frm_files = ttk.LabelFrame(self.root, text="Giriş Dosyaları (.op2 / .h5)")
         frm_files.pack(fill="both", expand=False, **pad)
 
-        self.lb_files = tk.Listbox(frm_files, selectmode=tk.EXTENDED, height=5, width=70)
-        self.lb_files.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        self.lb_files = tk.Listbox(frm_files, selectmode=tk.EXTENDED,
+                                    height=4, width=72)
+        self.lb_files.pack(side="left", fill="both", expand=True,
+                           padx=(4, 0), pady=4)
+        sb = ttk.Scrollbar(frm_files, orient="vertical",
+                            command=self.lb_files.yview)
+        sb.pack(side="left", fill="y", pady=4)
+        self.lb_files.configure(yscrollcommand=sb.set)
 
-        sb_files = ttk.Scrollbar(frm_files, orient="vertical", command=self.lb_files.yview)
-        sb_files.pack(side="left", fill="y", pady=4)
-        self.lb_files.configure(yscrollcommand=sb_files.set)
+        frm_fb = ttk.Frame(frm_files)
+        frm_fb.pack(side="left", padx=4, pady=4, anchor="n")
+        ttk.Button(frm_fb, text="Ekle",   width=14,
+                   command=self._add_files).pack(pady=2)
+        ttk.Button(frm_fb, text="Kaldır", width=14,
+                   command=self._remove_files).pack(pady=2)
+        self.btn_scan = ttk.Button(frm_fb, text="Dosyaları Tara", width=14,
+                                    command=self._scan_files)
+        self.btn_scan.pack(pady=(10, 2))
 
-        frm_file_btns = ttk.Frame(frm_files)
-        frm_file_btns.pack(side="left", padx=4, pady=4, anchor="n")
-        ttk.Button(frm_file_btns, text="Ekle",   width=10, command=self._add_files).pack(pady=2)
-        ttk.Button(frm_file_btns, text="Kaldır", width=10, command=self._remove_files).pack(pady=2)
+        # ── Bulunan result tipleri ────────────────────────────────────
+        frm_tree = ttk.LabelFrame(
+            self.root,
+            text="Bulunan Result Tipleri  —  seçmek/kaldırmak için satıra tıkla"
+        )
+        frm_tree.pack(fill="both", expand=True, **pad)
 
-        # ── Result types ───────────────────────────────────────────────
-        frm_types = ttk.LabelFrame(self.root, text="Result Tipleri")
-        frm_types.pack(fill="both", expand=False, **pad)
+        cols = ("n_sc", "n_files")
+        self.tv_results = ttk.Treeview(frm_tree, columns=cols,
+                                        show="tree headings", height=7)
+        self.tv_results.heading("#0",      text="Result Tipi")
+        self.tv_results.heading("n_sc",    text="Subcase Sayısı")
+        self.tv_results.heading("n_files", text="Dosya Sayısı")
+        self.tv_results.column("#0",      width=270)
+        self.tv_results.column("n_sc",    width=110, anchor="center")
+        self.tv_results.column("n_files", width=100, anchor="center")
+        self.tv_results.pack(side="left", fill="both", expand=True,
+                              padx=(4, 0), pady=4)
+        sb2 = ttk.Scrollbar(frm_tree, orient="vertical",
+                              command=self.tv_results.yview)
+        sb2.pack(side="left", fill="y", pady=4)
+        self.tv_results.configure(yscrollcommand=sb2.set)
+        self.tv_results.bind("<Button-1>", self._toggle_check)
 
-        self._type_vars: Dict[str, tk.BooleanVar] = {}
-        grid_frame = ttk.Frame(frm_types)
-        grid_frame.pack(fill="x", padx=4, pady=2)
+        frm_tb = ttk.Frame(frm_tree)
+        frm_tb.pack(side="left", padx=4, pady=4, anchor="n")
+        ttk.Button(frm_tb, text="Tümünü Seç",    width=14,
+                   command=lambda: self._set_all(True)).pack(pady=2)
+        ttk.Button(frm_tb, text="Tümünü Kaldır", width=14,
+                   command=lambda: self._set_all(False)).pack(pady=2)
 
-        cols = 4
-        for i, rt in enumerate(sorted(RESULT_ATTRIBUTES.keys())):
-            var = tk.BooleanVar(value=True)
-            self._type_vars[rt] = var
-            ttk.Checkbutton(grid_frame, text=rt, variable=var).grid(
-                row=i // cols, column=i % cols, sticky="w", padx=4, pady=1
-            )
-
-        frm_type_btns = ttk.Frame(frm_types)
-        frm_type_btns.pack(anchor="w", padx=4, pady=(0, 4))
-        ttk.Button(frm_type_btns, text="Tümünü Seç",    command=lambda: self._set_all_types(True)).pack(side="left", padx=2)
-        ttk.Button(frm_type_btns, text="Tümünü Kaldır", command=lambda: self._set_all_types(False)).pack(side="left", padx=2)
-
-        # ── Envelope output ────────────────────────────────────────────
-        frm_out = ttk.LabelFrame(self.root, text="Envelope Çıktısı")
+        # ── Çıktı ────────────────────────────────────────────────────
+        frm_out = ttk.LabelFrame(self.root, text="Çıktı Dosyası")
         frm_out.pack(fill="x", **pad)
 
-        frm_env_path = ttk.Frame(frm_out)
-        frm_env_path.pack(fill="x", padx=4, pady=2)
-        ttk.Label(frm_env_path, text="Dosya:").pack(side="left")
-        self.sv_envelope = tk.StringVar()
-        ttk.Entry(frm_env_path, textvariable=self.sv_envelope, width=55).pack(side="left", padx=4)
-        ttk.Button(frm_env_path, text="Gözat", command=self._browse_envelope).pack(side="left")
+        frm_op = ttk.Frame(frm_out)
+        frm_op.pack(fill="x", padx=4, pady=2)
+        ttk.Label(frm_op, text="Dosya:").pack(side="left")
+        self.sv_output = tk.StringVar()
+        ttk.Entry(frm_op, textvariable=self.sv_output, width=55).pack(
+            side="left", padx=4)
+        ttk.Button(frm_op, text="Gözat",
+                   command=self._browse_output).pack(side="left")
 
         frm_fmt = ttk.Frame(frm_out)
         frm_fmt.pack(anchor="w", padx=4, pady=(0, 4))
         ttk.Label(frm_fmt, text="Format:").pack(side="left")
-        self.sv_format = tk.StringVar(value="xlsx")
-        ttk.Radiobutton(frm_fmt, text="xlsx", variable=self.sv_format, value="xlsx").pack(side="left", padx=4)
-        ttk.Radiobutton(frm_fmt, text="csv",  variable=self.sv_format, value="csv").pack(side="left")
+        self.sv_fmt = tk.StringVar(value="op2")
+        ttk.Radiobutton(frm_fmt, text=".op2", variable=self.sv_fmt,
+                         value="op2").pack(side="left", padx=4)
+        ttk.Radiobutton(frm_fmt, text=".h5",  variable=self.sv_fmt,
+                         value="h5").pack(side="left")
 
-        # ── Governing report ───────────────────────────────────────────
-        frm_gov = ttk.LabelFrame(self.root, text="Governing Subcase Raporu (opsiyonel)")
-        frm_gov.pack(fill="x", **pad)
+        # ── Excel governing raporu ────────────────────────────────────
+        frm_xl = ttk.LabelFrame(self.root,
+                                  text="Excel Governing Raporu (opsiyonel)")
+        frm_xl.pack(fill="x", **pad)
 
-        self.bv_governing = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_gov, text="Governing raporu oluştur",
-                        variable=self.bv_governing,
-                        command=self._toggle_governing).pack(anchor="w", padx=4, pady=2)
+        self.bv_excel = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_xl, text="Excel raporu oluştur",
+                         variable=self.bv_excel,
+                         command=self._toggle_excel).pack(anchor="w",
+                                                           padx=4, pady=2)
+        frm_xlp = ttk.Frame(frm_xl)
+        frm_xlp.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(frm_xlp, text="Dosya:").pack(side="left")
+        self.sv_excel = tk.StringVar()
+        self.ent_excel = ttk.Entry(frm_xlp, textvariable=self.sv_excel,
+                                    width=55, state="disabled")
+        self.ent_excel.pack(side="left", padx=4)
+        self.btn_xl_browse = ttk.Button(frm_xlp, text="Gözat",
+                                         command=self._browse_excel,
+                                         state="disabled")
+        self.btn_xl_browse.pack(side="left")
 
-        frm_gov_path = ttk.Frame(frm_gov)
-        frm_gov_path.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Label(frm_gov_path, text="Dosya:").pack(side="left")
-        self.sv_governing = tk.StringVar()
-        self.ent_governing = ttk.Entry(frm_gov_path, textvariable=self.sv_governing, width=55, state="disabled")
-        self.ent_governing.pack(side="left", padx=4)
-        self.btn_gov_browse = ttk.Button(frm_gov_path, text="Gözat",
-                                         command=self._browse_governing, state="disabled")
-        self.btn_gov_browse.pack(side="left")
-
-        # ── Run button ─────────────────────────────────────────────────
+        # ── Hesapla ──────────────────────────────────────────────────
         self.btn_run = ttk.Button(self.root, text="Envelope Hesapla",
-                                  command=self._run, style="Accent.TButton")
+                                   command=self._run)
         self.btn_run.pack(fill="x", padx=8, pady=6)
 
-        # ── Log ────────────────────────────────────────────────────────
-        frm_log = ttk.LabelFrame(self.root, text="Log")
-        frm_log.pack(fill="both", expand=True, **pad)
+        # ── Governing tablosu ─────────────────────────────────────────
+        frm_gov = ttk.LabelFrame(self.root, text="Governing Subcase Tablosu")
+        frm_gov.pack(fill="both", expand=True, **pad)
 
-        self.log_text = scrolledtext.ScrolledText(frm_log, height=10, state="disabled",
-                                                  wrap="word", font=("Courier", 9))
+        gov_cols = ("result", "id", "max_file", "max_sc", "min_file", "min_sc")
+        self.tv_gov = ttk.Treeview(frm_gov, columns=gov_cols,
+                                    show="headings", height=7)
+        headers = {
+            "result":   "Result Tipi",
+            "id":       "Elem/Node ID",
+            "max_file": "Max Dosya",
+            "max_sc":   "Max Subcase",
+            "min_file": "Min Dosya",
+            "min_sc":   "Min Subcase",
+        }
+        for col, hdr in headers.items():
+            self.tv_gov.heading(col, text=hdr)
+            self.tv_gov.column(col, width=130, anchor="center")
+        self.tv_gov.pack(side="left", fill="both", expand=True,
+                          padx=(4, 0), pady=4)
+        sb3 = ttk.Scrollbar(frm_gov, orient="vertical",
+                              command=self.tv_gov.yview)
+        sb3.pack(side="left", fill="y", pady=4)
+        self.tv_gov.configure(yscrollcommand=sb3.set)
+
+        # ── Log ──────────────────────────────────────────────────────
+        frm_log = ttk.LabelFrame(self.root, text="Log")
+        frm_log.pack(fill="both", expand=False, **pad)
+        self.log_text = scrolledtext.ScrolledText(
+            frm_log, height=5, state="disabled",
+            wrap="word", font=("Courier", 9))
         self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ── Helpers ─────────────────────────────────────────────────────────────
 
     def _log(self, msg: str):
         def _append():
@@ -517,10 +405,16 @@ class LoadExtractionApp:
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
 
+    def _set_buttons(self, state: str):
+        self.root.after(0, lambda: self.btn_scan.configure(state=state))
+        self.root.after(0, lambda: self.btn_run.configure(state=state))
+
+    # ── File helpers ────────────────────────────────────────────────────────
+
     def _add_files(self):
         paths = filedialog.askopenfilenames(
             title="Nastran dosyaları seç",
-            filetypes=[("Nastran files", "*.op2 *.h5 *.hdf5"), ("All files", "*.*")],
+            filetypes=[("Nastran", "*.op2 *.h5 *.hdf5"), ("Tümü", "*.*")],
         )
         existing = list(self.lb_files.get(0, "end"))
         for p in paths:
@@ -531,127 +425,195 @@ class LoadExtractionApp:
         for idx in reversed(self.lb_files.curselection()):
             self.lb_files.delete(idx)
 
-    def _set_all_types(self, state: bool):
-        for var in self._type_vars.values():
-            var.set(state)
-
-    def _browse_envelope(self):
-        fmt = self.sv_format.get()
-        ext = ".xlsx" if fmt == "xlsx" else ".csv"
+    def _browse_output(self):
+        fmt = self.sv_fmt.get()
+        ext = ".op2" if fmt == "op2" else ".h5"
         path = filedialog.asksaveasfilename(
             title="Envelope çıktı dosyası",
             defaultextension=ext,
-            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("All", "*.*")],
+            filetypes=[("OP2", "*.op2"), ("HDF5", "*.h5"), ("Tümü", "*.*")],
         )
         if path:
-            self.sv_envelope.set(path)
+            self.sv_output.set(path)
 
-    def _browse_governing(self):
-        fmt = self.sv_format.get()
-        ext = ".xlsx" if fmt == "xlsx" else ".csv"
+    def _browse_excel(self):
         path = filedialog.asksaveasfilename(
-            title="Governing rapor dosyası",
-            defaultextension=ext,
-            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("All", "*.*")],
+            title="Excel raporu",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
         )
         if path:
-            self.sv_governing.set(path)
+            self.sv_excel.set(path)
 
-    def _toggle_governing(self):
-        state = "normal" if self.bv_governing.get() else "disabled"
-        self.ent_governing.configure(state=state)
-        self.btn_gov_browse.configure(state=state)
+    def _toggle_excel(self):
+        state = "normal" if self.bv_excel.get() else "disabled"
+        self.ent_excel.configure(state=state)
+        self.btn_xl_browse.configure(state=state)
 
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
+    # ── Checkable treeview ──────────────────────────────────────────────────
+
+    def _toggle_check(self, event):
+        iid = self.tv_results.identify_row(event.y)
+        if not iid:
+            return
+        new_state = not self._check_states.get(iid, True)
+        self._check_states[iid] = new_state
+        raw_text = self.tv_results.item(iid, "text").lstrip(
+            f"{CHECK_ON}{CHECK_OFF} "
+        )
+        self.tv_results.item(
+            iid, text=f"{CHECK_ON if new_state else CHECK_OFF} {raw_text}"
+        )
+
+    def _set_all(self, state: bool):
+        for iid in self.tv_results.get_children():
+            self._check_states[iid] = state
+            raw_text = self.tv_results.item(iid, "text").lstrip(
+                f"{CHECK_ON}{CHECK_OFF} "
+            )
+            self.tv_results.item(
+                iid, text=f"{CHECK_ON if state else CHECK_OFF} {raw_text}"
+            )
+
+    # ── Scan ────────────────────────────────────────────────────────────────
+
+    def _scan_files(self):
+        files = list(self.lb_files.get(0, "end"))
+        if not files:
+            messagebox.showwarning("Eksik", "Önce dosya ekleyin.")
+            return
+        self._clear_log()
+        self._set_buttons("disabled")
+        threading.Thread(target=self._worker_scan, args=(files,),
+                          daemon=True).start()
+
+    def _worker_scan(self, files: list[str]):
+        try:
+            self._log(f"{len(files)} dosya taranıyor...")
+            discovered = discover_results(files)
+            self._discovered = discovered
+            self.root.after(0, lambda: self._populate_results_tree(discovered))
+            self._log(f"{len(discovered)} result tipi bulundu.")
+        except Exception:
+            err = traceback.format_exc()
+            self._log(f"HATA:\n{err}")
+            self.root.after(0, lambda: messagebox.showerror("Tarama Hatası", err))
+        finally:
+            self._set_buttons("normal")
+
+    def _populate_results_tree(self, discovered: dict):
+        for iid in self.tv_results.get_children():
+            self.tv_results.delete(iid)
+        self._check_states.clear()
+        for rt, info in sorted(discovered.items()):
+            iid = self.tv_results.insert(
+                "", "end",
+                text=f"{CHECK_ON} {rt}",
+                values=(len(info["subcases"]), info["n_files"]),
+            )
+            self._check_states[iid] = True
+
+    # ── Run ─────────────────────────────────────────────────────────────────
 
     def _run(self):
-        input_files = list(self.lb_files.get(0, "end"))
-        if not input_files:
-            messagebox.showwarning("Eksik giriş", "Lütfen en az bir dosya ekleyin.")
+        files = list(self.lb_files.get(0, "end"))
+        if not files:
+            messagebox.showwarning("Eksik", "Dosya ekleyin.")
             return
 
-        selected_types = [rt for rt, var in self._type_vars.items() if var.get()]
+        selected_types = [
+            self.tv_results.item(iid, "text").lstrip(f"{CHECK_ON}{CHECK_OFF} ")
+            for iid, checked in self._check_states.items()
+            if checked
+        ]
         if not selected_types:
-            messagebox.showwarning("Eksik seçim", "Lütfen en az bir result tipi seçin.")
+            messagebox.showwarning("Eksik", "En az bir result tipi seçin.")
             return
 
-        envelope_path = self.sv_envelope.get().strip()
-        if not envelope_path:
-            messagebox.showwarning("Eksik yol", "Envelope çıktı dosyası belirtin.")
+        output_path = self.sv_output.get().strip()
+        if not output_path:
+            messagebox.showwarning("Eksik", "Çıktı dosyası yolu belirtin.")
             return
 
-        governing_path = None
-        if self.bv_governing.get():
-            governing_path = self.sv_governing.get().strip()
-            if not governing_path:
-                messagebox.showwarning("Eksik yol", "Governing rapor dosyası belirtin.")
+        excel_path = None
+        if self.bv_excel.get():
+            excel_path = self.sv_excel.get().strip()
+            if not excel_path:
+                messagebox.showwarning("Eksik", "Excel dosya yolu belirtin.")
                 return
 
-        fmt = self.sv_format.get()
-
-        # Clear log
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-
-        self.btn_run.configure(state="disabled")
+        fmt = self.sv_fmt.get()
+        self._clear_log()
+        self._set_buttons("disabled")
         threading.Thread(
-            target=self._worker,
-            args=(input_files, selected_types, envelope_path, governing_path, fmt),
+            target=self._worker_run,
+            args=(files, selected_types, output_path, fmt, excel_path),
             daemon=True,
         ).start()
 
-    def _worker(self, input_files, selected_types, envelope_path, governing_path, fmt):
+    def _worker_run(self, files, selected_types, output_path, fmt, excel_path):
         try:
-            self._log(f"{len(input_files)} dosya okunuyor...")
-            all_results = read_files(input_files, requested_types=selected_types)
+            self._log(f"Seçilen tipler: {', '.join(selected_types)}")
+            self._log(f"{len(files)} dosyadan veri okunuyor...")
+            raw = collect_raw(files, selected_types)
 
-            if not all_results:
+            if not raw:
                 self.root.after(0, lambda: messagebox.showerror(
-                    "Sonuç yok",
-                    "Dosyalarda seçilen result tipleri bulunamadı."
+                    "Sonuç Yok",
+                    "Seçilen result tipleri dosyalarda bulunamadı."
                 ))
                 return
 
-            self._log(f"{len(all_results)} subcase bulundu:")
-            for (fp, sc), type_dict in all_results.items():
-                self._log(f"  {os.path.basename(fp)}  subcase {sc}: {list(type_dict.keys())}")
+            self._log(f"Bulunan attribute'lar: {list(raw.keys())}")
+            self._log("Envelope hesaplanıyor...")
+            env_max, env_min, governing, templates, elem_ids = compute_envelope(raw)
 
-            self._log("\nEnvelope hesaplanıyor...")
-            envelope_max, envelope_min = compute_envelope(all_results)
+            self._log(f"Çıktı yazılıyor → {output_path}")
+            write_output(env_max, env_min, templates, output_path, fmt)
 
-            governing = None
-            if governing_path:
-                self._log("Governing raporu oluşturuluyor...")
-                governing = build_governing_report(all_results)
+            self._log("Governing tablosu oluşturuluyor...")
+            gov_df = build_governing_df(governing, elem_ids)
+            self.root.after(0, lambda: self._populate_governing_table(gov_df))
 
-            self._log(f"\nDosyaya yazılıyor → {envelope_path}")
-            export_results(
-                envelope_max=envelope_max,
-                envelope_min=envelope_min,
-                output_path=envelope_path,
-                fmt=fmt,
-                governing=governing,
-                governing_path=governing_path,
-            )
-            if governing_path:
-                self._log(f"Governing raporu → {governing_path}")
+            if excel_path and not gov_df.empty:
+                self._log(f"Excel raporu → {excel_path}")
+                export_governing_excel(gov_df, excel_path)
 
             self._log("\nTamamlandı.")
-            self.root.after(0, lambda: messagebox.showinfo("Tamamlandı", "Envelope başarıyla oluşturuldu."))
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Tamamlandı",
+                f"Envelope dosyası oluşturuldu:\n{output_path}"
+            ))
 
-        except Exception as exc:
-            self._log(f"\nHATA: {exc}")
-            self.root.after(0, lambda: messagebox.showerror("Hata", str(exc)))
+        except Exception:
+            err = traceback.format_exc()
+            self._log(f"HATA:\n{err}")
+            self.root.after(0, lambda: messagebox.showerror("Hata", err))
         finally:
-            self.root.after(0, lambda: self.btn_run.configure(state="normal"))
+            self._set_buttons("normal")
 
+    def _populate_governing_table(self, df: pd.DataFrame):
+        for iid in self.tv_gov.get_children():
+            self.tv_gov.delete(iid)
+        if df.empty:
+            return
+        for _, row in df.head(2000).iterrows():  # cap at 2000 rows for perf
+            self.tv_gov.insert("", "end", values=(
+                row["Result_Type"],
+                row["Element/Node_ID"],
+                row["Max_Gov_File"],
+                row["Max_Gov_Subcase"],
+                row["Min_Gov_File"],
+                row["Min_Gov_Subcase"],
+            ))
+
+
+# ─── Entry point ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    import traceback
-    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "envelope_error.txt")
+    _log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "envelope_error.txt"
+    )
     try:
         root = tk.Tk()
         app = LoadExtractionApp(root)
