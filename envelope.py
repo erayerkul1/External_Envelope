@@ -119,10 +119,20 @@ def discover_results(filepaths: list[str], log_fn=None) -> dict:
                     continue
                 entry = discovered.setdefault(rt, {"subcases": [], "_files": set()})
                 for sc_id in rd:
-                    entry["subcases"].append((filepath, sc_id))
+                    # store as (filepath, sc_id, attr) to allow dedup by sc_id
+                    entry["subcases"].append((filepath, sc_id, attr))
                 entry["_files"].add(filepath)
     for rt in discovered:
         discovered[rt]["n_files"] = len(discovered[rt].pop("_files"))
+        # unique subcase IDs (deduplicated across multiple element type attrs)
+        seen = set()
+        unique = []
+        for item in discovered[rt]["subcases"]:
+            key = (item[0], item[1])   # (filepath, sc_id)
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        discovered[rt]["subcases"] = unique
     return discovered
 
 
