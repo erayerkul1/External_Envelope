@@ -24,8 +24,23 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import Dict, Tuple
 
-import pandas as pd
-from pyNastran.op2.op2 import OP2
+# Heavy dependencies are imported lazily inside functions so that a missing
+# package shows a proper error dialog instead of silently crashing on
+# double-click. Top-level names are set to None and resolved on first use.
+try:
+    import pandas as pd
+    from pyNastran.op2.op2 import OP2
+    _DEPS_OK = True
+    _DEPS_ERR = ""
+except ImportError as _e:
+    pd = None  # type: ignore
+    OP2 = None  # type: ignore
+    _DEPS_OK = False
+    _DEPS_ERR = (
+        f"Gerekli kütüphane(ler) yüklü değil:\n{_e}\n\n"
+        "Lütfen terminalde şunu çalıştırın:\n"
+        "  pip install -r requirements.txt"
+    )
 
 # ---------------------------------------------------------------------------
 # Result type definitions
@@ -60,12 +75,14 @@ _ID_COLS = {"element_id", "node_id", "nid", "eid", "elementid", "nodeid"}
 
 def read_files(
     filepaths: list,
-    requested_types: list | None = None,
-) -> Dict[Tuple[str, int], Dict[str, pd.DataFrame]]:
+    requested_types: list = None,
+) -> Dict[Tuple[str, int], Dict]:
     """Read one or more .op2 / .h5 files.
 
     Returns {(filepath, subcase_id): {result_type: DataFrame}}
     """
+    if not _DEPS_OK:
+        raise RuntimeError(_DEPS_ERR)
     types_to_read = requested_types or list(RESULT_ATTRIBUTES.keys())
     combined: Dict[Tuple[str, int], Dict[str, pd.DataFrame]] = {}
 
@@ -625,8 +642,17 @@ class LoadExtractionApp:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        # CLI mode: let missing deps surface as a normal error message
+        if not _DEPS_OK:
+            print(f"HATA: {_DEPS_ERR}", file=sys.stderr)
+            sys.exit(1)
         main()
     else:
+        # GUI mode: show a dialog if deps are missing, then exit gracefully
         root = tk.Tk()
+        if not _DEPS_OK:
+            root.withdraw()
+            messagebox.showerror("Eksik Kütüphane", _DEPS_ERR)
+            sys.exit(1)
         app = LoadExtractionApp(root)
         root.mainloop()
