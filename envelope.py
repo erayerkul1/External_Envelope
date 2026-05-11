@@ -146,10 +146,13 @@ def collect_raw(filepaths: list[str], selected_types: list[str],
     """
     raw: dict = {}
     nastran_fmt: str = 'msc'
+    first_model = None
     for i, filepath in enumerate(filepaths):
         if log_fn:
             log_fn(f"[{i+1}/{len(filepaths)}] Okunuyor: {os.path.basename(filepath)}")
         model = _load_model(filepath, log_fn=log_fn)
+        if first_model is None:
+            first_model = model
         fmt = getattr(model, 'nastran_format', None)
         if fmt in ('msc', 'nx', 'optistruct'):
             nastran_fmt = fmt
@@ -165,7 +168,7 @@ def collect_raw(filepaths: list[str], selected_types: list[str],
         if log_fn:
             n = sum(len(v) for v in raw.values())
             log_fn(f"  Toplam {n} subcase yüklendi.")
-    return raw, nastran_fmt
+    return raw, nastran_fmt, first_model
 
 
 def _get_ids(result_obj) -> list:
@@ -233,15 +236,24 @@ def compute_envelope(raw: dict) -> tuple:
 
 def write_output(env_max: dict, env_min: dict, templates: dict,
                  output_path: str, fmt: str,
-                 nastran_format: str = 'msc') -> None:
+                 nastran_format: str = 'msc',
+                 out_model=None) -> None:
     """Write envelope as .op2 or .h5.
 
     Subcase 1 = MAX envelope, Subcase 2 = MIN envelope.
-    Uses deepcopy of template result objects so the original data is preserved.
+    Uses the first input model (out_model) as the base so all internal
+    pyNastran state (is_nx, nastran_format, etc.) is already populated.
     """
-    out_model = OP2(debug=False, log=None)
-    out_model.IS_TESTING = False
-    out_model.nastran_format = nastran_format
+    if out_model is None:
+        raise RuntimeError(
+            "write_output: çıktı için temel model gerekli (out_model=None)"
+        )
+
+    # Clear all result dicts on the model so only envelope data remains
+    for attrs in RESULT_ATTRIBUTES.values():
+        for attr in attrs:
+            if getattr(out_model, attr, {}):
+                setattr(out_model, attr, {})
 
     for attr, max_arr in env_max.items():
         min_arr  = env_min[attr]
@@ -624,7 +636,7 @@ class LoadExtractionApp:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
             self._log(f"{len(files)} dosyadan veri okunuyor...")
             timer.start()
-            raw, nastran_fmt = collect_raw(files, selected_types, log_fn=self._log)
+            raw, nastran_fmt, first_model = collect_raw(files, selected_types, log_fn=self._log)
             timer.stop()
 
             if not raw:
@@ -640,7 +652,7 @@ class LoadExtractionApp:
 
             self._log(f"Çıktı yazılıyor → {output_path}")
             write_output(env_max, env_min, templates, output_path, fmt,
-                         nastran_format=nastran_fmt)
+                         nastran_format=nastran_fmt, out_model=first_model)
 
             self._log("Governing tablosu oluşturuluyor...")
             gov_df = build_governing_df(governing, elem_ids)
