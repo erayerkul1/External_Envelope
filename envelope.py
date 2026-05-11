@@ -401,6 +401,10 @@ class LoadExtractionApp:
 
         self._build_ui()
 
+        if not _DEPS_OK:
+            messagebox.showerror("Eksik Kütüphane", _DEPS_ERR)
+            self.btn_run.configure(state="disabled")
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -491,22 +495,26 @@ class LoadExtractionApp:
         frm_log = ttk.LabelFrame(self.root, text="Log")
         frm_log.pack(fill="both", expand=True, **pad)
 
-        self.log = scrolledtext.ScrolledText(frm_log, height=10, state="disabled",
-                                              wrap="word", font=("Courier", 9))
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+        self.log_text = scrolledtext.ScrolledText(frm_log, height=10, state="disabled",
+                                                  wrap="word", font=("Courier", 9))
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _log(self, msg: str):
-        """Append a line to the log widget (thread-safe)."""
         def _append():
-            self.log.configure(state="normal")
-            self.log.insert("end", msg + "\n")
-            self.log.see("end")
-            self.log.configure(state="disabled")
+            self.log_text.config(state="normal")
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
         self.root.after(0, _append)
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
 
     def _add_files(self):
         paths = filedialog.askopenfilenames(
@@ -640,19 +648,7 @@ class LoadExtractionApp:
             self.root.after(0, lambda: self.btn_run.configure(state="normal"))
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        # CLI mode: let missing deps surface as a normal error message
-        if not _DEPS_OK:
-            print(f"HATA: {_DEPS_ERR}", file=sys.stderr)
-            sys.exit(1)
-        main()
-    else:
-        # GUI mode: show a dialog if deps are missing, then exit gracefully
-        root = tk.Tk()
-        if not _DEPS_OK:
-            root.withdraw()
-            messagebox.showerror("Eksik Kütüphane", _DEPS_ERR)
-            sys.exit(1)
-        app = LoadExtractionApp(root)
-        root.mainloop()
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = LoadExtractionApp(root)
+    root.mainloop()
