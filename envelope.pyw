@@ -145,12 +145,16 @@ def collect_raw(filepaths: list[str], selected_types: list[str],
     {attr: [(filepath, sc_id, result_obj), ...]}
     """
     raw: dict = {}
+    nastran_fmt: str = 'msc'
     for i, filepath in enumerate(filepaths):
         if log_fn:
             log_fn(f"[{i+1}/{len(filepaths)}] Okunuyor: {os.path.basename(filepath)}")
         model = _load_model(filepath, log_fn=log_fn)
+        fmt = getattr(model, 'nastran_format', None)
+        if fmt in ('msc', 'nx', 'optistruct'):
+            nastran_fmt = fmt
         if log_fn:
-            log_fn(f"  Dosya okundu. Seçili result tipleri yükleniyor...")
+            log_fn(f"  Dosya okundu (nastran_format={nastran_fmt}). Seçili result tipleri yükleniyor...")
         for rt in selected_types:
             for attr in RESULT_ATTRIBUTES.get(rt, ()):
                 rd = getattr(model, attr, {})
@@ -161,7 +165,7 @@ def collect_raw(filepaths: list[str], selected_types: list[str],
         if log_fn:
             n = sum(len(v) for v in raw.values())
             log_fn(f"  Toplam {n} subcase yüklendi.")
-    return raw
+    return raw, nastran_fmt
 
 
 def _get_ids(result_obj) -> list:
@@ -228,7 +232,8 @@ def compute_envelope(raw: dict) -> tuple:
 
 
 def write_output(env_max: dict, env_min: dict, templates: dict,
-                 output_path: str, fmt: str) -> None:
+                 output_path: str, fmt: str,
+                 nastran_format: str = 'msc') -> None:
     """Write envelope as .op2 or .h5.
 
     Subcase 1 = MAX envelope, Subcase 2 = MIN envelope.
@@ -236,7 +241,7 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
     """
     out_model = OP2(debug=False, log=None)
     out_model.IS_TESTING = False
-    out_model.nastran_format = 'msc'
+    out_model.nastran_format = nastran_format
 
     for attr, max_arr in env_max.items():
         min_arr  = env_min[attr]
@@ -257,7 +262,7 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
         setattr(out_model, attr, {1: res_max, 2: res_min})
 
     if fmt == "op2":
-        out_model.write_op2(output_path)
+        out_model.write_op2(output_path, nastran_format=nastran_format)
     else:
         out_model.export_hdf5(output_path)
 
@@ -619,7 +624,7 @@ class LoadExtractionApp:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
             self._log(f"{len(files)} dosyadan veri okunuyor...")
             timer.start()
-            raw = collect_raw(files, selected_types, log_fn=self._log)
+            raw, nastran_fmt = collect_raw(files, selected_types, log_fn=self._log)
             timer.stop()
 
             if not raw:
@@ -634,7 +639,8 @@ class LoadExtractionApp:
             env_max, env_min, governing, templates, elem_ids = compute_envelope(raw)
 
             self._log(f"Çıktı yazılıyor → {output_path}")
-            write_output(env_max, env_min, templates, output_path, fmt)
+            write_output(env_max, env_min, templates, output_path, fmt,
+                         nastran_format=nastran_fmt)
 
             self._log("Governing tablosu oluşturuluyor...")
             gov_df = build_governing_df(governing, elem_ids)
