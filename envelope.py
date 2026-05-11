@@ -236,6 +236,7 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
     """
     out_model = OP2(debug=False, log=None)
     out_model.IS_TESTING = False
+    out_model.nastran_format = 'msc'
 
     for attr, max_arr in env_max.items():
         min_arr  = env_min[attr]
