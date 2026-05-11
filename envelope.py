@@ -30,8 +30,12 @@ RESULT_ATTRIBUTES: dict[str, tuple[str, ...]] = {
     "displacements":  ("displacements",),
     "velocities":     ("velocities",),
     "accelerations":  ("accelerations",),
+    "eigenvectors":   ("eigenvectors",),
+    "temperatures":   ("temperatures",),
     "spc_forces":     ("spc_forces",),
     "mpc_forces":     ("mpc_forces",),
+    "gpforce":        ("grid_point_forces",),
+    "oload":          ("load_vectors", "load_vectors_v", "force_vectors"),
     "plate_stress":   ("cquad4_stress", "ctria3_stress", "cquad8_stress", "ctria6_stress"),
     "plate_strain":   ("cquad4_strain", "ctria3_strain", "cquad8_strain", "ctria6_strain"),
     "solid_stress":   ("chexa_stress", "ctetra_stress", "cpenta_stress"),
@@ -45,6 +49,10 @@ RESULT_ATTRIBUTES: dict[str, tuple[str, ...]] = {
     "plate_force":    ("cquad4_force", "ctria3_force", "cquad8_force", "ctria6_force"),
     "bar_force":      ("cbar_force",),
     "beam_force":     ("cbeam_force",),
+    "rod_force":      ("crod_force", "conrod_force", "ctube_force"),
+    "spring_force":   ("celas1_force", "celas2_force", "celas3_force", "celas4_force"),
+    "bush_force":     ("cbush_force",),
+    "gap_force":      ("cgap_force",),
 }
 
 CHECK_ON  = "☑"
@@ -249,15 +257,13 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
             "write_output: çıktı için temel model gerekli (out_model=None)"
         )
 
-    # Clear ALL subcase-keyed dicts on the model (not just known types).
-    # This catches result attributes not listed in RESULT_ATTRIBUTES
-    # (e.g. eigenvectors, grid_point_forces) that would otherwise be
-    # written with all original subcases, bloating the output file.
-    for attr_name, val in list(vars(out_model).items()):
-        if isinstance(val, dict) and val:
-            keys = list(val.keys())
-            if keys and all(isinstance(k, int) for k in keys[:5]):
-                setattr(out_model, attr_name, {})
+    # Clear all known result dicts so only envelope data is written.
+    # Use the explicit RESULT_ATTRIBUTES list — clearing arbitrary int-keyed
+    # dicts via vars() would also wipe geometry tables and corrupt the file.
+    for attrs in RESULT_ATTRIBUTES.values():
+        for attr in attrs:
+            if getattr(out_model, attr, {}):
+                setattr(out_model, attr, {})
 
     for attr, max_arr in env_max.items():
         min_arr  = env_min[attr]
