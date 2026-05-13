@@ -14,6 +14,9 @@ try:
     import numpy as np
     import pandas as pd
     from pyNastran.op2.op2 import OP2, read_op2
+    # np.float was removed in NumPy 1.20; old openpyxl versions still reference it.
+    if not hasattr(np, 'float'):
+        np.float = float   # type: ignore[attr-defined]
     _DEPS_OK = True
     _DEPS_ERR = ""
 except ImportError as _e:
