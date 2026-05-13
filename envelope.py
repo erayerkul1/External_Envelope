@@ -12,11 +12,11 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 try:
     import numpy as np
     import pandas as pd
-    from pyNastran.op2.op2 import OP2
+    from pyNastran.op2.op2 import OP2, read_op2
     _DEPS_OK = True
     _DEPS_ERR = ""
 except ImportError as _e:
-    np = pd = OP2 = None  # type: ignore
+    np = pd = OP2 = read_op2 = None  # type: ignore
     _DEPS_OK = False
     _DEPS_ERR = (
         f"Gerekli kütüphane(ler) yüklü değil:\n{_e}\n\n"
@@ -86,12 +86,9 @@ class _ProgressTimer:
 
 # ─── Backend ────────────────────────────────────────────────────────────────
 
-def _load_model(filepath: str, log_fn=None) -> OP2:
-    model = OP2(debug=False, log=None)
-    model.IS_TESTING = False
+def _load_model(filepath: str, log_fn=None, load_geometry: bool = False):
     ext = os.path.splitext(filepath)[1].lower()
 
-    # Show file size before the blocking read
     try:
         size_mb = os.path.getsize(filepath) / 1024 / 1024
         if log_fn:
@@ -99,9 +96,19 @@ def _load_model(filepath: str, log_fn=None) -> OP2:
     except OSError:
         pass
 
-    if ext == ".op2":
+    if ext == ".op2" and load_geometry:
+        # read_op2() returns an OP2Geom which includes GEOM1/GEOM2/EPT/MPT
+        # tables. write_op2() then writes those tables so HyperView can
+        # validate and attach results.
+        model = read_op2(filepath, load_geometry=True,
+                         combine=True, log=None, debug=False)
+    elif ext == ".op2":
+        model = OP2(debug=False, log=None)
+        model.IS_TESTING = False
         model.read_op2(filepath, combine=True)
     else:
+        model = OP2(debug=False, log=None)
+        model.IS_TESTING = False
         model.load_hdf5_filename(filepath)
     return model
 
@@ -158,9 +165,15 @@ def collect_raw(filepaths: list[str], selected_types: list[str],
     for i, filepath in enumerate(filepaths):
         if log_fn:
             log_fn(f"[{i+1}/{len(filepaths)}] Okunuyor: {os.path.basename(filepath)}")
-        model = _load_model(filepath, log_fn=log_fn)
         if first_model is None:
+            # Load geometry tables on the first file so write_op2 includes
+            # GEOM1/GEOM2/EPT/MPT — required for HyperView to attach results.
+            model = _load_model(filepath, log_fn=log_fn, load_geometry=True)
             first_model = model
+            if log_fn:
+                log_fn("  Geometry tablolar yüklendi (HyperView uyumu için).")
+        else:
+            model = _load_model(filepath, log_fn=log_fn, load_geometry=False)
         fmt = getattr(model, 'nastran_format', None)
         if fmt in ('msc', 'nx', 'optistruct'):
             nastran_fmt = fmt
