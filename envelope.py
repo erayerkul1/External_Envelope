@@ -274,6 +274,13 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
 
         try:
             res_max.isubcase = 1
+            # Reset load step ID so HyperView matches subcase 1 in the BDF.
+            # Without this, lsdvmns keeps the original subcase number (e.g. 71027)
+            # and HyperView fails to find a matching subcase definition.
+            if hasattr(res_max, 'lsdvmns'):
+                res_max.lsdvmns = np.array([1], dtype=res_max.lsdvmns.dtype)
+            if hasattr(res_max, 'dts'):
+                res_max.dts = np.array([0.0], dtype=res_max.dts.dtype)
         except Exception:
             pass
 
