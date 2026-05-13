@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import struct as _struct
 import sys
 import threading
 import traceback
@@ -255,54 +256,237 @@ def compute_envelope(raw: dict) -> tuple:
     return env_max, env_min, governing, templates, elem_ids
 
 
+def write_msc_displacement_op2(
+        node_ids, gridtypes, disp_data, output_path,
+        isubcase=1, lsdvmns=1,
+        approach_code=12, table_code=1,
+        num_wide=8, random_code=0, thermal=0, format_code=1,
+        title='', subtitle='', label='',
+        date=None):
+    """Write a HyperView-compatible MSC Nastran binary OP2 with OUGV1 displacements.
+
+    Uses raw struct.pack to produce the exact Fortran-record byte format that
+    MSC Nastran itself writes (and that HyperView's OP2 reader expects).
+
+    pyNastran's write_op2 writes multiple result tables together (displacement,
+    gpforce, spc_forces, load_vectors, …). At least one of those extra tables
+    appears in a format that confuses HyperView's parser, causing it to report
+    "No results/supported Result Blocks found".  Writing ONLY the single OUGV1
+    displacement table avoids this problem entirely.
+
+    approach_code, table_code, num_wide, random_code, thermal, format_code
+    should be extracted from the original displacement result template so that
+    HyperView recognises the analysis type correctly.
+    """
+    from datetime import datetime as _dt
+    if date is None:
+        t = _dt.today()
+        date = (t.month, t.day, t.year)
+    month, day, year = date
+    dyear = year - 2000
+
+    node_ids  = np.asarray(node_ids,  dtype=np.int32)
+    gridtypes = np.asarray(gridtypes, dtype=np.int32)
+    disp_data = np.asarray(disp_data, dtype=np.float32)
+    if disp_data.ndim == 1:
+        disp_data = disp_data.reshape(-1, 6)
+    disp_data = disp_data[:, :6]
+    nnodes = len(node_ids)
+
+    device_code = 2   # Plot
+
+    # Per-node data: [node*10+device, gridtype, t1..t6] written as float32 bytes
+    dev_ids    = (node_ids * 10 + device_code).astype(np.int32)
+    ids_gt     = np.column_stack([dev_ids, gridtypes])   # (nnodes, 2) int32
+    ids_gt_f32 = ids_gt.view(np.float32)                  # same bytes, float32 view
+    row_data   = np.hstack([ids_gt_f32, disp_data])       # (nnodes, 8) float32
+    data_bytes = row_data.tobytes()
+    ntotal     = nnodes * 8   # number of float32 words
+
+    P = _struct.pack
+
+    def rec(fmt, *vals):
+        """Fortran record: [length][data][length]"""
+        d = P('<' + fmt, *vals)
+        n = len(d)
+        return P('<i', n) + d + P('<i', n)
+
+    def mk(v):
+        """Single-word marker record: [4][v][4]"""
+        return P('<iii', 4, v, 4)
+
+    def _pad128(s):
+        b = s[:128].encode('ascii', errors='replace')
+        return b.ljust(128, b' ')[:128]
+
+    # Table3 payload: 50 int32 words + 3 × 128-byte strings = 584 bytes
+    # Layout matches pyNastran _write_table_3 exactly (words 1-50):
+    #   1:approach_code  2:table_code  3:0           4:isubcase     5:lsdvmns
+    #   6:field6=0       7:field7=0    8:random_code 9:format_code  10:num_wide
+    #  11:oCode=0       12:acoustic=0 13-15:0
+    #  16-20:0
+    #  21-22:0          23:thermal    24-33:0
+    #  34-46:0
+    #  47-50:0
+    ti = [
+        approach_code, table_code, 0, isubcase, lsdvmns,   # words 1-5
+        0, 0, random_code, format_code, num_wide,           # words 6-10
+        0, 0, 0, 0, 0,                                      # words 11-15
+        0, 0, 0, 0, 0,                                      # words 16-20
+        0, 0, thermal, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,       # words 21-33
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,             # words 34-46
+        0, 0, 0, 0,                                         # words 47-50
+    ]   # total: 50 integers
+    assert len(ti) == 50
+    t3_bytes = P('<50i', *ti) + _pad128(title) + _pad128(subtitle) + _pad128(label)
+    assert len(t3_bytes) == 584
+
+    tape_code = b'NASTRAN FORT TAPE ID CODE - '   # exactly 28 bytes
+    assert len(tape_code) == 28
+
+    with open(output_path, 'wb') as f:
+        # ── File header (PARAM,POST,-1 / MSC format) ────────────────────
+        f.write(mk(3))                                   # marker = 3
+        f.write(rec('3i', day, month, dyear))            # date record
+        f.write(mk(7))                                   # marker = 7
+        f.write(rec('28s', tape_code))                   # tape code string
+        f.write(mk(2))                                   # marker = 2
+        f.write(rec('8s', b'XXXXXXXX'))                  # Nastran version
+        f.write(mk(-1))                                  # end-header marker
+        f.write(mk(0))
+
+        # ── OUGV1 result table header ────────────────────────────────────
+        # Table-name block: marker=2 then 8-char name
+        f.write(P('<iii', 4, 2, 4))
+        f.write(P('<i8si', 8, b'OUGV1   ', 8))
+
+        f.write(mk(-1))
+        f.write(mk(7))
+        f.write(rec('7i', 102, 0, 0, 0, 512, 0, 0))     # table info block
+
+        f.write(mk(-2))
+        f.write(mk(1))
+        f.write(mk(0))
+
+        f.write(mk(7))
+        f.write(rec('8siiiii', b'OUG1    ', month, day, dyear, 0, 1))
+
+        # ── TABLE3 — subcase descriptor (itable = -3) ────────────────────
+        itable = -3
+        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0)); f.write(mk(146))
+        f.write(P('<i', 584) + t3_bytes + P('<i', 584))
+
+        # ── Data record (itable = -4) ────────────────────────────────────
+        itable -= 1   # -4
+        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0)); f.write(mk(ntotal))
+        rec_len = ntotal * 4
+        f.write(P('<i', rec_len) + data_bytes + P('<i', rec_len))
+
+        # ── End-of-subcase markers (itable = -5) ────────────────────────
+        itable -= 1   # -5
+        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0))
+
+        # ── End-of-table + end-of-file ───────────────────────────────────
+        f.write(mk(0))   # close result table
+        f.write(mk(0))   # close file
+
+
 def write_output(env_max: dict, env_min: dict, templates: dict,
                  output_path: str, fmt: str,
                  nastran_format: str = 'msc',
-                 out_model=None) -> None:
-    """Write envelope as .op2 or .h5.
+                 out_model=None) -> list:
+    """Write displacement envelope as OP2 or write all results to HDF5.
 
-    Subcase 1 = MAX envelope, Subcase 2 = MIN envelope.
-    Uses the first input model (out_model) as the base so all internal
-    pyNastran state (is_nx, nastran_format, etc.) is already populated.
+    For fmt='op2':
+        Writes displacement (OUGV1) using raw struct.pack to produce the exact
+        MSC Nastran binary format that HyperView can read.  pyNastran's
+        write_op2 produces a subtly different format that HyperView rejects.
+        Returns a list of attribute names NOT written to OP2 — caller should
+        export those to Excel.
+
+    For fmt='h5':
+        Writes all result types via pyNastran export_hdf5.  Returns [].
     """
-    if out_model is None:
-        raise RuntimeError(
-            "write_output: çıktı için temel model gerekli (out_model=None)"
-        )
-
-    # Clear all known result dicts so only envelope data is written.
-    # Use the explicit RESULT_ATTRIBUTES list — clearing arbitrary int-keyed
-    # dicts via vars() would also wipe geometry tables and corrupt the file.
-    for attrs in RESULT_ATTRIBUTES.values():
-        for attr in attrs:
-            if getattr(out_model, attr, {}):
-                setattr(out_model, attr, {})
-
-    for attr, max_arr in env_max.items():
-        min_arr  = env_min[attr]
-        template = templates[attr]
-
-        res_max = deepcopy(template)
-        res_max.data = max_arr[np.newaxis, :, :]   # (1, nelems, ncomp)
-
-        try:
-            res_max.isubcase = 1
-            # Reset load step ID so HyperView matches subcase 1 in the BDF.
-            # Without this, lsdvmns keeps the original subcase number (e.g. 71027)
-            # and HyperView fails to find a matching subcase definition.
-            if hasattr(res_max, 'lsdvmns'):
-                res_max.lsdvmns = np.array([1], dtype=res_max.lsdvmns.dtype)
-            if hasattr(res_max, 'dts'):
-                res_max.dts = np.array([0.0], dtype=res_max.dts.dtype)
-        except Exception:
-            pass
-
-        setattr(out_model, attr, {1: res_max})
-
     if fmt == "op2":
-        out_model.write_op2(output_path, nastran_format=nastran_format)
-    else:
+        disp_attrs = set(RESULT_ATTRIBUTES.get("displacements", ()))
+        written = []
+
+        for attr, max_arr in env_max.items():
+            if attr not in disp_attrs:
+                continue
+            template = templates[attr]
+            if not hasattr(template, "node_gridtype"):
+                continue
+
+            node_ids  = template.node_gridtype[:, 0]
+            gridtypes = template.node_gridtype[:, 1]
+
+            # Preserve original subcase/lsdvmns so HyperView matches the BDF.
+            isubcase = int(getattr(template, "isubcase", 1) or 1)
+            lsdvmns  = isubcase
+            if hasattr(template, "lsdvmns") and len(template.lsdvmns) > 0:
+                lsdvmns = int(template.lsdvmns[0])
+                isubcase = lsdvmns
+
+            # Extract TABLE3 codes from the original result so HyperView
+            # recognises the result type correctly.
+            approach_code = int(getattr(template, "approach_code", 12) or 12)
+            table_code    = int(getattr(template, "table_code",    1)  or 1)
+            num_wide      = int(getattr(template, "num_wide",      8)  or 8)
+            random_code   = int(getattr(template, "random_code",   0))
+            thermal       = int(getattr(template, "thermal",       0))
+            format_code   = int(getattr(template, "format_code",   1)  or 1)
+
+            title    = getattr(template, "title",    "") or ""
+            subtitle = getattr(template, "subtitle", "") or ""
+            label    = getattr(template, "label",    "") or ""
+
+            write_msc_displacement_op2(
+                node_ids, gridtypes, max_arr, output_path,
+                isubcase=isubcase, lsdvmns=lsdvmns,
+                approach_code=approach_code, table_code=table_code,
+                num_wide=num_wide, random_code=random_code,
+                thermal=thermal, format_code=format_code,
+                title=title, subtitle=subtitle, label=label,
+            )
+            written.append(attr)
+            break   # only one displacement attribute → OP2
+
+        if not written:
+            raise RuntimeError(
+                "Displacement (OUGV1) verisi bulunamadı.\n"
+                "OP2 çıktısı için seçili tipler arasında 'displacements' olmalı."
+            )
+
+        not_written = [a for a in env_max if a not in written]
+        return not_written
+
+    else:   # h5
+        if out_model is None:
+            raise RuntimeError(
+                "write_output: h5 için temel model gerekli (out_model=None)"
+            )
+        for attrs in RESULT_ATTRIBUTES.values():
+            for attr in attrs:
+                if getattr(out_model, attr, {}):
+                    setattr(out_model, attr, {})
+
+        for attr, max_arr in env_max.items():
+            template = templates[attr]
+            res_max = deepcopy(template)
+            res_max.data = max_arr[np.newaxis, :, :]
+            try:
+                res_max.isubcase = 1
+                if hasattr(res_max, "lsdvmns"):
+                    res_max.lsdvmns = np.array([1], dtype=res_max.lsdvmns.dtype)
+                if hasattr(res_max, "dts"):
+                    res_max.dts = np.array([0.0], dtype=res_max.dts.dtype)
+            except Exception:
+                pass
+            setattr(out_model, attr, {1: res_max})
+
         out_model.export_hdf5(output_path)
+        return []
 
 
 def build_governing_df(governing: dict, elem_ids: dict) -> pd.DataFrame:
@@ -331,6 +515,49 @@ def export_governing_excel(df: pd.DataFrame, path: str) -> None:
             df[df["Result_Type"] == rt].to_excel(
                 writer, sheet_name=rt[:31], index=False
             )
+
+
+def export_envelope_excel(
+        env_max: dict, env_min: dict,
+        elem_ids: dict, governing: dict,
+        path: str, templates: dict = None) -> None:
+    """Write envelope values and governing info to Excel.
+
+    One sheet per result attribute (max and min columns), plus a 'governing'
+    sheet showing which subcase/file drives each element.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for attr, max_arr in sorted(env_max.items()):
+            min_arr = env_min.get(attr)
+            ids     = elem_ids.get(attr, list(range(max_arr.shape[0])))
+
+            # Try to get meaningful column header names from the template
+            hdrs: list = []
+            if templates and attr in templates:
+                raw_hdrs = getattr(templates[attr], "headers", None)
+                if raw_hdrs:
+                    hdrs = list(raw_hdrs)
+
+            n_comp = max_arr.shape[1]
+            if len(hdrs) != n_comp:
+                hdrs = [f"comp{i+1}" for i in range(n_comp)]
+
+            row: dict = {"ID": ids}
+            for j, h in enumerate(hdrs):
+                row[f"max_{h}"] = max_arr[:, j]
+            if min_arr is not None:
+                for j, h in enumerate(hdrs):
+                    row[f"min_{h}"] = min_arr[:, j]
+
+            pd.DataFrame(row).to_excel(
+                writer, sheet_name=attr[:31], index=False
+            )
+
+        # Governing sheet
+        gov_df = build_governing_df(governing, elem_ids)
+        if not gov_df.empty:
+            gov_df.to_excel(writer, sheet_name="governing"[:31], index=False)
 
 # ─── GUI ────────────────────────────────────────────────────────────────────
 
@@ -431,16 +658,18 @@ class LoadExtractionApp:
         ttk.Radiobutton(frm_fmt, text=".h5",  variable=self.sv_fmt,
                          value="h5").pack(side="left")
 
-        # ── Excel governing raporu ────────────────────────────────────
-        frm_xl = ttk.LabelFrame(self.root,
-                                  text="Excel Governing Raporu (opsiyonel)")
+        # ── Excel çıktısı ─────────────────────────────────────────────
+        frm_xl = ttk.LabelFrame(
+            self.root,
+            text="Excel Çıktısı  (.op2 modunda kuvvet/gerilme tipleri otomatik eklenir)")
         frm_xl.pack(fill="x", **pad)
 
         self.bv_excel = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_xl, text="Excel raporu oluştur",
-                         variable=self.bv_excel,
-                         command=self._toggle_excel).pack(anchor="w",
-                                                           padx=4, pady=2)
+        ttk.Checkbutton(
+            frm_xl,
+            text="Excel yolu belirt  (belirtilmezse OP2 yanına otomatik kaydedilir)",
+            variable=self.bv_excel,
+            command=self._toggle_excel).pack(anchor="w", padx=4, pady=2)
         frm_xlp = ttk.Frame(frm_xl)
         frm_xlp.pack(fill="x", padx=4, pady=(0, 4))
         ttk.Label(frm_xlp, text="Dosya:").pack(side="left")
@@ -662,7 +891,8 @@ class LoadExtractionApp:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
             self._log(f"{len(files)} dosyadan veri okunuyor...")
             timer.start()
-            raw, nastran_fmt, first_model = collect_raw(files, selected_types, log_fn=self._log)
+            raw, nastran_fmt, first_model = collect_raw(
+                files, selected_types, log_fn=self._log)
             timer.stop()
 
             if not raw:
@@ -677,22 +907,48 @@ class LoadExtractionApp:
             env_max, env_min, governing, templates, elem_ids = compute_envelope(raw)
 
             self._log(f"Çıktı yazılıyor → {output_path}")
-            write_output(env_max, env_min, templates, output_path, fmt,
-                         nastran_format=nastran_fmt, out_model=first_model)
+            not_in_op2 = write_output(
+                env_max, env_min, templates, output_path, fmt,
+                nastran_format=nastran_fmt, out_model=first_model)
+
+            # For OP2 format: non-displacement results go to Excel automatically.
+            # If the user specified an Excel path, use that; otherwise auto-name it.
+            if fmt == "op2" and not_in_op2:
+                xl_target = excel_path or (
+                    os.path.splitext(output_path)[0] + "_results.xlsx")
+                self._log(
+                    f"Displacement dışı result tipleri Excel'e aktarılıyor "
+                    f"({', '.join(not_in_op2)}) → {xl_target}"
+                )
+                extra_max = {a: env_max[a] for a in not_in_op2 if a in env_max}
+                extra_min = {a: env_min[a] for a in not_in_op2 if a in env_min}
+                extra_ids = {a: elem_ids[a] for a in not_in_op2 if a in elem_ids}
+                extra_gov = {a: governing[a] for a in not_in_op2 if a in governing}
+                export_envelope_excel(extra_max, extra_min, extra_ids,
+                                      extra_gov, xl_target, templates=templates)
+                finish_msg = (
+                    f"OP2 (displacement):\n  {output_path}\n\n"
+                    f"Excel (diğer result tipleri + governing):\n  {xl_target}"
+                )
+            elif fmt != "op2" and excel_path:
+                # H5 mode: write governing-only Excel if user requested it
+                gov_df = build_governing_df(governing, elem_ids)
+                self._log(f"Excel raporu → {excel_path}")
+                export_governing_excel(gov_df, excel_path)
+                finish_msg = (
+                    f"H5 dosyası:\n  {output_path}\n\n"
+                    f"Excel raporu:\n  {excel_path}"
+                )
+            else:
+                finish_msg = f"Envelope dosyası oluşturuldu:\n{output_path}"
 
             self._log("Governing tablosu oluşturuluyor...")
             gov_df = build_governing_df(governing, elem_ids)
             self.root.after(0, lambda: self._populate_governing_table(gov_df))
 
-            if excel_path and not gov_df.empty:
-                self._log(f"Excel raporu → {excel_path}")
-                export_governing_excel(gov_df, excel_path)
-
             self._log("\nTamamlandı.")
             self.root.after(0, lambda: messagebox.showinfo(
-                "Tamamlandı",
-                f"Envelope dosyası oluşturuldu:\n{output_path}"
-            ))
+                "Tamamlandı", finish_msg))
 
         except Exception:
             timer.stop()
