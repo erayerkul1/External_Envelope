@@ -259,6 +259,84 @@ def compute_envelope(raw: dict) -> tuple:
     return env_max, env_min, governing, templates, elem_ids
 
 
+def collect_and_envelope(filepaths, selected_types, log_fn=None):
+    """Single-pass streaming envelope — O(1) peak memory vs O(N) for collect_raw+compute_envelope.
+
+    Returns: (env_max, env_min, governing, templates, elem_ids, nastran_fmt, first_model)
+    """
+    import time as _time
+    env_max = {}; env_min = {}
+    abs_sum_max = {}; abs_sum_min = {}
+    gov_file_max = {}; gov_sc_max = {}
+    gov_file_min = {}; gov_sc_min = {}
+    templates = {}; elem_ids = {}
+    nastran_fmt = 'msc'; first_model = None
+    t0 = _time.time()
+
+    for i, filepath in enumerate(filepaths):
+        if log_fn:
+            log_fn(f"[{i+1}/{len(filepaths)}] {os.path.basename(filepath)}  "
+                   f"({int(_time.time()-t0)}s geçti)")
+        load_geom = (first_model is None)
+        model = _load_model(filepath, log_fn=log_fn, load_geometry=load_geom)
+        if first_model is None:
+            first_model = model
+        fmt = getattr(model, 'nastran_format', None)
+        if fmt in ('msc', 'nx', 'optistruct'):
+            nastran_fmt = fmt
+
+        for rt in selected_types:
+            for attr in RESULT_ATTRIBUTES.get(rt, ()):
+                rd = getattr(model, attr, {})
+                if not rd:
+                    continue
+                for sc_id, result_obj in rd.items():
+                    try:
+                        arr = result_obj.data[-1].astype(np.float32, copy=False)
+                    except Exception:
+                        continue
+                    abs_s = np.abs(arr).sum(axis=1)   # (nelems,)
+
+                    if attr not in env_max:
+                        env_max[attr]      = arr.copy()
+                        env_min[attr]      = arr.copy()
+                        abs_sum_max[attr]  = abs_s.copy()
+                        abs_sum_min[attr]  = abs_s.copy()
+                        n = len(abs_s)
+                        gov_file_max[attr] = np.full(n, filepath, dtype=object)
+                        gov_sc_max[attr]   = np.full(n, sc_id,   dtype=object)
+                        gov_file_min[attr] = np.full(n, filepath, dtype=object)
+                        gov_sc_min[attr]   = np.full(n, sc_id,   dtype=object)
+                        templates[attr]    = result_obj
+                        elem_ids[attr]     = _get_ids(result_obj)
+                    else:
+                        if arr.shape != env_max[attr].shape:
+                            continue
+                        np.maximum(env_max[attr], arr, out=env_max[attr])
+                        np.minimum(env_min[attr], arr, out=env_min[attr])
+                        mask = abs_s > abs_sum_max[attr]
+                        if mask.any():
+                            abs_sum_max[attr][mask]  = abs_s[mask]
+                            gov_file_max[attr][mask] = filepath
+                            gov_sc_max[attr][mask]   = sc_id
+                        mask = abs_s < abs_sum_min[attr]
+                        if mask.any():
+                            abs_sum_min[attr][mask]  = abs_s[mask]
+                            gov_file_min[attr][mask] = filepath
+                            gov_sc_min[attr][mask]   = sc_id
+
+    governing = {
+        attr: {
+            "max": list(zip(gov_file_max[attr], gov_sc_max[attr])),
+            "min": list(zip(gov_file_min[attr], gov_sc_min[attr])),
+        }
+        for attr in env_max
+    }
+    if log_fn:
+        log_fn(f"Envelope tamamlandı. ({int(_time.time()-t0)}s)")
+    return env_max, env_min, governing, templates, elem_ids, nastran_fmt, first_model
+
+
 # ─── Raw MSC Nastran binary OP2 writer ─────────────────────────────────────
 # Attribute sets used to classify results for OP2 table type selection.
 # Nodal results share the OUGV1 TABLE3 layout (word 3 = 0, word 8 = random_code).
@@ -1055,22 +1133,21 @@ class LoadExtractionApp:
         timer = _ProgressTimer(self._log)
         try:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
-            self._log(f"{len(files)} dosyadan veri okunuyor...")
+            self._log(f"{len(files)} dosyadan veri okunuyor ve envelope hesaplanıyor (streaming)...")
             timer.start()
-            raw, nastran_fmt, first_model = collect_raw(
+            (env_max, env_min, governing, templates, elem_ids,
+             nastran_fmt, first_model) = collect_and_envelope(
                 files, selected_types, log_fn=self._log)
             timer.stop()
 
-            if not raw:
+            if not env_max:
                 self.root.after(0, lambda: messagebox.showerror(
                     "Sonuç Yok",
                     "Seçilen result tipleri dosyalarda bulunamadı."
                 ))
                 return
 
-            self._log(f"Bulunan attribute'lar: {list(raw.keys())}")
-            self._log("Envelope hesaplanıyor...")
-            env_max, env_min, governing, templates, elem_ids = compute_envelope(raw)
+            self._log(f"Bulunan attribute'lar: {list(env_max.keys())}")
 
             self._log(f"Çıktı yazılıyor → {output_path}")
             not_in_op2 = write_output(
