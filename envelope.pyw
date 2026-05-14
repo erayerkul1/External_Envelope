@@ -259,27 +259,303 @@ def compute_envelope(raw: dict) -> tuple:
     return env_max, env_min, governing, templates, elem_ids
 
 
-def write_msc_displacement_op2(
-        node_ids, gridtypes, disp_data, output_path,
-        isubcase=1, lsdvmns=1,
-        approach_code=12, table_code=1,
-        num_wide=8, random_code=0, thermal=0, format_code=1,
-        title='', subtitle='', label='',
-        date=None):
-    """Write a HyperView-compatible MSC Nastran binary OP2 with OUGV1 displacements.
+# ─── Raw MSC Nastran binary OP2 writer ─────────────────────────────────────
+# Attribute sets used to classify results for OP2 table type selection.
+# Nodal results share the OUGV1 TABLE3 layout (word 3 = 0, word 8 = random_code).
+# Element results use the OES/OEF TABLE3 layout (word 3 = element_type, word 8 = load_set).
 
-    Uses raw struct.pack to produce the exact Fortran-record byte format that
-    MSC Nastran itself writes (and that HyperView's OP2 reader expects).
+_OP2_NODAL_ATTRS = frozenset([
+    'displacements', 'velocities', 'accelerations', 'eigenvectors', 'temperatures',
+    'spc_forces', 'mpc_forces',
+])
+# Centroid plate stress/strain: element_node.shape=(2*N,2), data.shape=(2*N,8), num_wide=17
+_OP2_PLATE_STRESS_ATTRS = frozenset([
+    'cquad4_stress', 'ctria3_stress', 'cquadr_stress', 'ctriar_stress',
+    'cquad4_strain', 'ctria3_strain', 'cquadr_strain', 'ctriar_strain',
+])
+# Plate forces: element.shape=(N,), data.shape=(N,8), num_wide=9
+_OP2_PLATE_FORCE_ATTRS = frozenset([
+    'cquad4_force', 'ctria3_force',
+])
+# Centroid element types supported by _prep_plate_stress_data
+_CENTROID_ELEMENT_TYPES = frozenset([33, 74, 227, 228])
 
-    pyNastran's write_op2 writes multiple result tables together (displacement,
-    gpforce, spc_forces, load_vectors, …). At least one of those extra tables
-    appears in a format that confuses HyperView's parser, causing it to report
-    "No results/supported Result Blocks found".  Writing ONLY the single OUGV1
-    displacement table avoids this problem entirely.
 
-    approach_code, table_code, num_wide, random_code, thermal, format_code
-    should be extracted from the original displacement result template so that
-    HyperView recognises the analysis type correctly.
+def _mk(v: int) -> bytes:
+    """Single-word Fortran marker: [4, v, 4]"""
+    return _struct.pack('<iii', 4, v, 4)
+
+
+def _frec(fmt: str, *vals) -> bytes:
+    """Fortran record: [n][payload][n]"""
+    d = _struct.pack('<' + fmt, *vals)
+    n = len(d)
+    return _struct.pack('<i', n) + d + _struct.pack('<i', n)
+
+
+def _pad128(s: str) -> bytes:
+    b = s[:128].encode('ascii', errors='replace')
+    return b.ljust(128, b' ')[:128]
+
+
+def _op2_file_header(month: int, day: int, dyear: int) -> bytes:
+    """MSC Nastran OP2 file header (PARAM,POST,-1 format)."""
+    tape = b'NASTRAN FORT TAPE ID CODE - '
+    out  = _mk(3)
+    out += _frec('3i', day, month, dyear)
+    out += _mk(7)
+    out += _frec('28s', tape)
+    out += _mk(2)
+    out += _frec('8s', b'XXXXXXXX')
+    out += _mk(-1)
+    out += _mk(0)
+    return out
+
+
+def _op2_table_header_block(table_name: str, subtable_name: bytes,
+                             month: int, day: int, dyear: int) -> bytes:
+    """Write one result-table's opening: table-name block + date record."""
+    tname8 = ('%-8s' % table_name[:8]).encode('ascii')
+    sub8   = b'%-8s' % subtable_name[:8]
+    out  = _struct.pack('<iii',  4, 2, 4)
+    out += _struct.pack('<i8si', 8, tname8, 8)
+    out += _struct.pack('<6i',   4, -1, 4, 4, 7, 4)
+    out += _struct.pack('<9i',   28, 102, 0, 0, 0, 512, 0, 0, 28)
+    out += _struct.pack('<9i',   4, -2, 4, 4, 1, 4, 4, 0, 4)
+    out += _struct.pack('<iii',  4, 7, 4)
+    out += _struct.pack('<i', 28) + sub8
+    out += _struct.pack('<iiiii', month, day, dyear, 0, 1)
+    out += _struct.pack('<i', 28)
+    return out
+
+
+def _op2_table3_block(t3_words: list, title: str, subtitle: str, label: str) -> bytes:
+    """Write TABLE3 descriptor (itable=-3): 50 int32 words + 3×128-byte strings."""
+    assert len(t3_words) == 50
+    payload = _struct.pack('<50i', *t3_words) + _pad128(title) + _pad128(subtitle) + _pad128(label)
+    assert len(payload) == 584
+    out  = _mk(-3); out += _mk(1); out += _mk(0); out += _mk(146)
+    out += _struct.pack('<i', 584) + payload + _struct.pack('<i', 584)
+    return out
+
+
+def _op2_data_and_end(data_bytes: bytes, ntotal: int) -> bytes:
+    """Write data record (itable=-4) then end-of-subcase markers (itable=-5)."""
+    rec_len = ntotal * 4
+    assert len(data_bytes) == rec_len, f'{len(data_bytes)} != {rec_len}'
+    out  = _mk(-4); out += _mk(1); out += _mk(0); out += _mk(ntotal)
+    out += _struct.pack('<i', rec_len) + data_bytes + _struct.pack('<i', rec_len)
+    out += _mk(-5); out += _mk(1); out += _mk(0)
+    return out
+
+
+def _t3_ougv(approach_code, table_code, isubcase, lsdvmns,
+             random_code, format_code, num_wide, thermal) -> list:
+    """50-word TABLE3 for OUGV1/OQG1/OQMG1 (nodal). Word 3=0, word 8=random_code."""
+    return [
+        approach_code, table_code, 0, isubcase, lsdvmns,
+        0, 0, random_code, format_code, num_wide,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, thermal, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+    ]
+
+
+def _t3_oes(approach_code, table_code, element_type, isubcase, lsdvmns,
+            load_set, format_code, num_wide, s_code, thermal) -> list:
+    """50-word TABLE3 for OES1X/OEF1X (element). Word 3=element_type, word 8=load_set."""
+    return [
+        approach_code, table_code, element_type, isubcase, lsdvmns,
+        0, 0, load_set, format_code, num_wide,
+        s_code, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, thermal, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+    ]
+
+
+def _get_lsdvmns(template) -> int:
+    """Return lsdvmns[0] from template, falling back to isubcase."""
+    isubcase = int(getattr(template, 'isubcase', 1) or 1)
+    lsv = getattr(template, 'lsdvmns', None)
+    if lsv is not None and len(lsv) > 0:
+        return int(lsv[0])
+    return isubcase
+
+
+def _prep_nodal_data(template, env_data):
+    """(data_bytes, ntotal) for OUGV1-style nodal results (disp/vel/accel/spc/mpc)."""
+    if not hasattr(template, 'node_gridtype'):
+        return None
+    node_ids  = template.node_gridtype[:, 0].astype(np.int32)
+    gridtypes = template.node_gridtype[:, 1].astype(np.int32)
+    data = np.asarray(env_data, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(-1, 6)
+    data = data[:, :6]
+    if len(data) != len(node_ids):
+        return None
+    dev = int(getattr(template, 'device_code', 2) or 2)
+    dev_ids    = (node_ids * 10 + dev).astype(np.int32)
+    ids_gt     = np.column_stack([dev_ids, gridtypes]).view(np.float32)
+    row_data   = np.hstack([ids_gt, data])
+    return row_data.tobytes(), len(node_ids) * 8
+
+
+def _prep_plate_stress_data(template, env_data):
+    """(data_bytes, ntotal) for OES1X centroid plate stress/strain.
+    element_node.shape=(2*N,2), env_data.shape=(2*N,8), num_wide=17.
+    Each element row: [eid_device_as_f32, 16 float32 values].
+    """
+    if not hasattr(template, 'element_node'):
+        return None
+    etype = getattr(template, 'element_type', None)
+    if etype not in _CENTROID_ELEMENT_TYPES:
+        return None
+    eids        = template.element_node[:, 0].astype(np.int32)
+    nelements   = len(np.unique(eids))
+    if len(eids) != 2 * nelements:
+        return None
+    dev         = int(getattr(template, 'device_code', 2) or 2)
+    eid_device  = (eids[::2] * 10 + dev).astype(np.int32)
+    data_f32    = np.asarray(env_data, dtype=np.float32)
+    if data_f32.shape != (2 * nelements, 8):
+        return None
+    data2       = data_f32.reshape(nelements, 16)
+    out         = np.empty((nelements, 17), dtype=np.float32)
+    out[:, 0]   = eid_device.view(np.float32)
+    out[:, 1:]  = data2
+    return out.tobytes(), nelements * 17
+
+
+def _prep_plate_force_data(template, env_data):
+    """(data_bytes, ntotal) for OEF1X plate forces (CQUAD4/CTRIA3).
+    element.shape=(N,), env_data.shape=(N,8), num_wide=9.
+    Each element row: [eid_device_as_f32, 8 float32 values].
+    """
+    if not hasattr(template, 'element'):
+        return None
+    eids        = template.element.astype(np.int32)
+    nelements   = len(eids)
+    dev         = int(getattr(template, 'device_code', 2) or 2)
+    eid_device  = (eids * 10 + dev).astype(np.int32)
+    data_f32    = np.asarray(env_data, dtype=np.float32)
+    if data_f32.shape != (nelements, 8):
+        return None
+    out         = np.empty((nelements, 9), dtype=np.float32)
+    out[:, 0]   = eid_device.view(np.float32)
+    out[:, 1:]  = data_f32
+    return out.tobytes(), nelements * 9
+
+
+def _build_nodal_spec(attr, template, env_data):
+    """Table spec dict for OUGV1/OQG1/OQMG1 nodal result."""
+    prep = _prep_nodal_data(template, env_data)
+    if prep is None:
+        return None
+    data_bytes, ntotal = prep
+    lsdvmns     = _get_lsdvmns(template)
+    approach    = int(getattr(template, 'approach_code', 12) or 12)
+    tc          = int(getattr(template, 'table_code', 1) or 1)
+    rand        = int(getattr(template, 'random_code', 0))
+    thermal     = int(getattr(template, 'thermal', 0))
+    fmt_code    = int(getattr(template, 'format_code', 1) or 1)
+    tname = getattr(template, 'table_name', None) or (
+        'OQG1' if attr == 'spc_forces' else
+        'OQMG1' if attr == 'mpc_forces' else 'OUGV1')
+    sub = getattr(template, 'subtable_name', None) or (
+        b'OQG1    ' if attr == 'spc_forces' else
+        b'OQMG1   ' if attr == 'mpc_forces' else b'OUG1    ')
+    if isinstance(sub, str):
+        sub = sub.encode('ascii')
+    return {
+        'table_name':    tname,
+        'subtable_name': sub,
+        'table3_words':  _t3_ougv(approach, tc, lsdvmns, lsdvmns, rand, fmt_code, 8, thermal),
+        'data_bytes':    data_bytes,
+        'ntotal':        ntotal,
+        'title':    getattr(template, 'title',    '') or '',
+        'subtitle': getattr(template, 'subtitle', '') or '',
+        'label':    getattr(template, 'label',    '') or '',
+    }
+
+
+def _build_plate_stress_spec(attr, template, env_data):
+    """Table spec dict for OES1X centroid plate stress/strain."""
+    prep = _prep_plate_stress_data(template, env_data)
+    if prep is None:
+        return None
+    data_bytes, ntotal = prep
+    lsdvmns  = _get_lsdvmns(template)
+    approach = int(getattr(template, 'approach_code', 12) or 12)
+    tc       = int(getattr(template, 'table_code', 5) or 5)
+    etype    = int(getattr(template, 'element_type', 33) or 33)
+    ls       = int(getattr(template, 'load_set', 1) or 1)
+    s_code   = int(getattr(template, 's_code', 0))
+    thermal  = int(getattr(template, 'thermal', 0))
+    fmt_code = int(getattr(template, 'format_code', 1) or 1)
+    tname = getattr(template, 'table_name', None) or 'OES1X'
+    sub   = getattr(template, 'subtable_name', None) or b'OES1    '
+    if isinstance(sub, str):
+        sub = sub.encode('ascii')
+    return {
+        'table_name':    tname,
+        'subtable_name': sub,
+        'table3_words':  _t3_oes(approach, tc, etype, lsdvmns, lsdvmns, ls, fmt_code, 17, s_code, thermal),
+        'data_bytes':    data_bytes,
+        'ntotal':        ntotal,
+        'title':    getattr(template, 'title',    '') or '',
+        'subtitle': getattr(template, 'subtitle', '') or '',
+        'label':    getattr(template, 'label',    '') or '',
+    }
+
+
+def _build_plate_force_spec(attr, template, env_data):
+    """Table spec dict for OEF1X plate forces (CQUAD4/CTRIA3)."""
+    prep = _prep_plate_force_data(template, env_data)
+    if prep is None:
+        return None
+    data_bytes, ntotal = prep
+    lsdvmns  = _get_lsdvmns(template)
+    approach = int(getattr(template, 'approach_code', 12) or 12)
+    tc       = int(getattr(template, 'table_code', 4) or 4)
+    etype    = int(getattr(template, 'element_type', 33) or 33)
+    ls       = int(getattr(template, 'load_set', 1) or 1)
+    thermal  = int(getattr(template, 'thermal', 0))
+    fmt_code = int(getattr(template, 'format_code', 1) or 1)
+    tname = getattr(template, 'table_name', None) or 'OEF1X'
+    sub   = getattr(template, 'subtable_name', None) or b'OEF1    '
+    if isinstance(sub, str):
+        sub = sub.encode('ascii')
+    return {
+        'table_name':    tname,
+        'subtable_name': sub,
+        'table3_words':  _t3_oes(approach, tc, etype, lsdvmns, lsdvmns, ls, fmt_code, 9, 0, thermal),
+        'data_bytes':    data_bytes,
+        'ntotal':        ntotal,
+        'title':    getattr(template, 'title',    '') or '',
+        'subtitle': getattr(template, 'subtitle', '') or '',
+        'label':    getattr(template, 'label',    '') or '',
+    }
+
+
+def write_msc_op2(table_specs: list, output_path: str, date=None) -> None:
+    """Write multiple result tables to a single HyperView-compatible MSC Nastran OP2.
+
+    Uses raw struct.pack so only the requested tables appear in the file —
+    pyNastran's write_op2 emits extra tables (GPFORCE, OLOAD, …) that confuse
+    HyperView's parser and cause "No results/supported Result Blocks found".
+
+    Each spec in table_specs:
+        table_name   : str    8-char table name  (e.g. 'OUGV1', 'OES1X')
+        subtable_name: bytes  8-char subtable     (e.g. b'OUG1    ')
+        table3_words : list[int]  50 TABLE3 int32 words
+        data_bytes   : bytes  packed float32 result data
+        ntotal       : int    number of float32 words in data_bytes
+        title/subtitle/label : str  (optional)
     """
     from datetime import datetime as _dt
     if date is None:
@@ -288,179 +564,66 @@ def write_msc_displacement_op2(
     month, day, year = date
     dyear = year - 2000
 
-    node_ids  = np.asarray(node_ids,  dtype=np.int32)
-    gridtypes = np.asarray(gridtypes, dtype=np.int32)
-    disp_data = np.asarray(disp_data, dtype=np.float32)
-    if disp_data.ndim == 1:
-        disp_data = disp_data.reshape(-1, 6)
-    disp_data = disp_data[:, :6]
-    nnodes = len(node_ids)
-
-    device_code = 2   # Plot
-
-    # Per-node data: [node*10+device, gridtype, t1..t6] written as float32 bytes
-    dev_ids    = (node_ids * 10 + device_code).astype(np.int32)
-    ids_gt     = np.column_stack([dev_ids, gridtypes])   # (nnodes, 2) int32
-    ids_gt_f32 = ids_gt.view(np.float32)                  # same bytes, float32 view
-    row_data   = np.hstack([ids_gt_f32, disp_data])       # (nnodes, 8) float32
-    data_bytes = row_data.tobytes()
-    ntotal     = nnodes * 8   # number of float32 words
-
-    P = _struct.pack
-
-    def rec(fmt, *vals):
-        """Fortran record: [length][data][length]"""
-        d = P('<' + fmt, *vals)
-        n = len(d)
-        return P('<i', n) + d + P('<i', n)
-
-    def mk(v):
-        """Single-word marker record: [4][v][4]"""
-        return P('<iii', 4, v, 4)
-
-    def _pad128(s):
-        b = s[:128].encode('ascii', errors='replace')
-        return b.ljust(128, b' ')[:128]
-
-    # Table3 payload: 50 int32 words + 3 × 128-byte strings = 584 bytes
-    # Layout matches pyNastran _write_table_3 exactly (words 1-50):
-    #   1:approach_code  2:table_code  3:0           4:isubcase     5:lsdvmns
-    #   6:field6=0       7:field7=0    8:random_code 9:format_code  10:num_wide
-    #  11:oCode=0       12:acoustic=0 13-15:0
-    #  16-20:0
-    #  21-22:0          23:thermal    24-33:0
-    #  34-46:0
-    #  47-50:0
-    ti = [
-        approach_code, table_code, 0, isubcase, lsdvmns,   # words 1-5
-        0, 0, random_code, format_code, num_wide,           # words 6-10
-        0, 0, 0, 0, 0,                                      # words 11-15
-        0, 0, 0, 0, 0,                                      # words 16-20
-        0, 0, thermal, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,       # words 21-33
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,             # words 34-46
-        0, 0, 0, 0,                                         # words 47-50
-    ]   # total: 50 integers
-    assert len(ti) == 50
-    t3_bytes = P('<50i', *ti) + _pad128(title) + _pad128(subtitle) + _pad128(label)
-    assert len(t3_bytes) == 584
-
-    tape_code = b'NASTRAN FORT TAPE ID CODE - '   # exactly 28 bytes
-    assert len(tape_code) == 28
-
     with open(output_path, 'wb') as f:
-        # ── File header (PARAM,POST,-1 / MSC format) ────────────────────
-        f.write(mk(3))                                   # marker = 3
-        f.write(rec('3i', day, month, dyear))            # date record
-        f.write(mk(7))                                   # marker = 7
-        f.write(rec('28s', tape_code))                   # tape code string
-        f.write(mk(2))                                   # marker = 2
-        f.write(rec('8s', b'XXXXXXXX'))                  # Nastran version
-        f.write(mk(-1))                                  # end-header marker
-        f.write(mk(0))
-
-        # ── OUGV1 result table header ────────────────────────────────────
-        # Table-name block: marker=2 then 8-char name
-        f.write(P('<iii', 4, 2, 4))
-        f.write(P('<i8si', 8, b'OUGV1   ', 8))
-
-        f.write(mk(-1))
-        f.write(mk(7))
-        f.write(rec('7i', 102, 0, 0, 0, 512, 0, 0))     # table info block
-
-        f.write(mk(-2))
-        f.write(mk(1))
-        f.write(mk(0))
-
-        f.write(mk(7))
-        f.write(rec('8siiiii', b'OUG1    ', month, day, dyear, 0, 1))
-
-        # ── TABLE3 — subcase descriptor (itable = -3) ────────────────────
-        itable = -3
-        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0)); f.write(mk(146))
-        f.write(P('<i', 584) + t3_bytes + P('<i', 584))
-
-        # ── Data record (itable = -4) ────────────────────────────────────
-        itable -= 1   # -4
-        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0)); f.write(mk(ntotal))
-        rec_len = ntotal * 4
-        f.write(P('<i', rec_len) + data_bytes + P('<i', rec_len))
-
-        # ── End-of-subcase markers (itable = -5) ────────────────────────
-        itable -= 1   # -5
-        f.write(mk(itable)); f.write(mk(1)); f.write(mk(0))
-
-        # ── End-of-table + end-of-file ───────────────────────────────────
-        f.write(mk(0))   # close result table
-        f.write(mk(0))   # close file
+        f.write(_op2_file_header(month, day, dyear))
+        for spec in table_specs:
+            f.write(_op2_table_header_block(
+                spec['table_name'], spec['subtable_name'], month, day, dyear))
+            f.write(_op2_table3_block(
+                spec['table3_words'],
+                spec.get('title', ''), spec.get('subtitle', ''), spec.get('label', '')))
+            f.write(_op2_data_and_end(spec['data_bytes'], spec['ntotal']))
+            f.write(_mk(0))   # close this table
+        f.write(_mk(0))       # EOF
 
 
 def write_output(env_max: dict, env_min: dict, templates: dict,
                  output_path: str, fmt: str,
                  nastran_format: str = 'msc',
                  out_model=None) -> list:
-    """Write displacement envelope as OP2 or write all results to HDF5.
+    """Write envelope results to OP2 (all supported types) or HDF5.
 
     For fmt='op2':
-        Writes displacement (OUGV1) using raw struct.pack to produce the exact
-        MSC Nastran binary format that HyperView can read.  pyNastran's
-        write_op2 produces a subtly different format that HyperView rejects.
-        Returns a list of attribute names NOT written to OP2 — caller should
-        export those to Excel.
+        Writes OUGV1 (displacement/vel/accel), OQG1/OQMG1 (spc/mpc forces),
+        OES1X centroid (plate stress/strain for CQUAD4/CTRIA3), and
+        OEF1X (plate forces for CQUAD4/CTRIA3) using raw struct.pack.
+        Returns a list of attribute names NOT written to OP2 (e.g. solid
+        stress, rod/bar/beam results) — caller exports those to Excel.
 
     For fmt='h5':
-        Writes all result types via pyNastran export_hdf5.  Returns [].
+        Writes all result types via pyNastran export_hdf5. Returns [].
     """
     if fmt == "op2":
-        disp_attrs = set(RESULT_ATTRIBUTES.get("displacements", ()))
-        written = []
+        table_specs = []
+        written: set = set()
 
         for attr, max_arr in env_max.items():
-            if attr not in disp_attrs:
+            template = templates.get(attr)
+            if template is None:
                 continue
-            template = templates[attr]
-            if not hasattr(template, "node_gridtype"):
-                continue
+            try:
+                if attr in _OP2_NODAL_ATTRS:
+                    spec = _build_nodal_spec(attr, template, max_arr)
+                elif attr in _OP2_PLATE_STRESS_ATTRS:
+                    spec = _build_plate_stress_spec(attr, template, max_arr)
+                elif attr in _OP2_PLATE_FORCE_ATTRS:
+                    spec = _build_plate_force_spec(attr, template, max_arr)
+                else:
+                    spec = None
+            except Exception:
+                spec = None
+            if spec is not None:
+                table_specs.append(spec)
+                written.add(attr)
 
-            node_ids  = template.node_gridtype[:, 0]
-            gridtypes = template.node_gridtype[:, 1]
-
-            # Preserve original subcase/lsdvmns so HyperView matches the BDF.
-            isubcase = int(getattr(template, "isubcase", 1) or 1)
-            lsdvmns  = isubcase
-            if hasattr(template, "lsdvmns") and len(template.lsdvmns) > 0:
-                lsdvmns = int(template.lsdvmns[0])
-                isubcase = lsdvmns
-
-            # Extract TABLE3 codes from the original result so HyperView
-            # recognises the result type correctly.
-            approach_code = int(getattr(template, "approach_code", 12) or 12)
-            table_code    = int(getattr(template, "table_code",    1)  or 1)
-            num_wide      = int(getattr(template, "num_wide",      8)  or 8)
-            random_code   = int(getattr(template, "random_code",   0))
-            thermal       = int(getattr(template, "thermal",       0))
-            format_code   = int(getattr(template, "format_code",   1)  or 1)
-
-            title    = getattr(template, "title",    "") or ""
-            subtitle = getattr(template, "subtitle", "") or ""
-            label    = getattr(template, "label",    "") or ""
-
-            write_msc_displacement_op2(
-                node_ids, gridtypes, max_arr, output_path,
-                isubcase=isubcase, lsdvmns=lsdvmns,
-                approach_code=approach_code, table_code=table_code,
-                num_wide=num_wide, random_code=random_code,
-                thermal=thermal, format_code=format_code,
-                title=title, subtitle=subtitle, label=label,
-            )
-            written.append(attr)
-            break   # only one displacement attribute → OP2
-
-        if not written:
+        if not table_specs:
             raise RuntimeError(
-                "Displacement (OUGV1) verisi bulunamadı.\n"
-                "OP2 çıktısı için seçili tipler arasında 'displacements' olmalı."
+                "OP2 çıktısı için desteklenen result tipi bulunamadı.\n"
+                "Seçili tipler arasında displacements, spc_forces, plate_stress "
+                "veya plate_force olmalı."
             )
 
+        write_msc_op2(table_specs, output_path)
         not_written = [a for a in env_max if a not in written]
         return not_written
 
@@ -914,13 +1077,14 @@ class LoadExtractionApp:
                 env_max, env_min, templates, output_path, fmt,
                 nastran_format=nastran_fmt, out_model=first_model)
 
-            # For OP2 format: non-displacement results go to Excel automatically.
+            # For OP2 format: unsupported result types (solid stress, rod/bar/beam
+            # stress, etc.) go to Excel automatically alongside all governing info.
             # If the user specified an Excel path, use that; otherwise auto-name it.
             if fmt == "op2" and not_in_op2:
                 xl_target = excel_path or (
                     os.path.splitext(output_path)[0] + "_results.xlsx")
                 self._log(
-                    f"Displacement dışı result tipleri Excel'e aktarılıyor "
+                    f"OP2'ye yazılamayan tipler Excel'e aktarılıyor "
                     f"({', '.join(not_in_op2)}) → {xl_target}"
                 )
                 extra_max = {a: env_max[a] for a in not_in_op2 if a in env_max}
@@ -930,7 +1094,8 @@ class LoadExtractionApp:
                 export_envelope_excel(extra_max, extra_min, extra_ids,
                                       extra_gov, xl_target, templates=templates)
                 finish_msg = (
-                    f"OP2 (displacement):\n  {output_path}\n\n"
+                    f"OP2 (displacement, plate_stress, plate_force, spc/mpc forces):\n"
+                    f"  {output_path}\n\n"
                     f"Excel (diğer result tipleri + governing):\n  {xl_target}"
                 )
             elif fmt != "op2" and excel_path:
