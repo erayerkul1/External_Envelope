@@ -662,16 +662,39 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
     """Write envelope results to OP2 (all supported types) or HDF5.
 
     For fmt='op2':
-        Writes OUGV1 (displacement/vel/accel), OQG1/OQMG1 (spc/mpc forces),
-        OES1X centroid (plate stress/strain for CQUAD4/CTRIA3), and
-        OEF1X (plate forces for CQUAD4/CTRIA3) using raw struct.pack.
-        Returns a list of attribute names NOT written to OP2 (e.g. solid
-        stress, rod/bar/beam results) — caller exports those to Excel.
+        If out_model has geometry (nodes/elements loaded via load_geometry=True),
+        uses pyNastran's write_op2() so GEOM1/GEOM2/EPT/MPT tables are preserved.
+        Otherwise falls back to raw struct.pack writer for result tables only.
+        Returns a list of attribute names NOT written to OP2.
 
     For fmt='h5':
         Writes all result types via pyNastran export_hdf5. Returns [].
     """
     if fmt == "op2":
+        has_geom = out_model is not None and bool(getattr(out_model, "nodes", {}))
+        if has_geom:
+            for attrs in RESULT_ATTRIBUTES.values():
+                for attr in attrs:
+                    if getattr(out_model, attr, {}):
+                        setattr(out_model, attr, {})
+            for attr, max_arr in env_max.items():
+                template = templates.get(attr)
+                if template is None:
+                    continue
+                res_max = deepcopy(template)
+                res_max.data = max_arr[np.newaxis, :, :]
+                try:
+                    res_max.isubcase = 1
+                    if hasattr(res_max, "lsdvmns"):
+                        res_max.lsdvmns = np.array([1], dtype=res_max.lsdvmns.dtype)
+                    if hasattr(res_max, "dts"):
+                        res_max.dts = np.array([0.0], dtype=res_max.dts.dtype)
+                except Exception:
+                    pass
+                setattr(out_model, attr, {1: res_max})
+            out_model.write_op2(output_path, nastran_format=nastran_format)
+            return []
+
         table_specs = []
         written: set = set()
 
