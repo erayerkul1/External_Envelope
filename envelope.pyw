@@ -644,23 +644,28 @@ def _extract_op2_geom_prefix(filepath: str) -> bytes:
         return b''
 
     marker = _struct.pack('<3i', 4, -1, 4)   # little-endian [4][-1][4]
-    pos = 0
-    while True:
-        idx = data.find(marker, pos)
-        if idx == -1:
-            break
-        rec_start = idx + 12             # skip 12-byte marker → Fortran record
-        if rec_start + 8 > len(data):
-            break
-        rec_len = _struct.unpack_from('<i', data, rec_start)[0]
-        if 0 < rec_len <= len(data) - rec_start - 8:
-            content = data[rec_start + 4: rec_start + 4 + rec_len]
-            for name in _OP2_RESULT_TABLE_NAMES:
-                if name in content:
-                    return data[:idx]    # geometry prefix found
-        pos = idx + 1
 
-    return b''
+    # Find the earliest occurrence of any result table name in the raw bytes.
+    # Searching for the name directly is more robust than relying on the
+    # Fortran record length that immediately follows [4][-1][4], because the
+    # number of records between the marker and the table-name record varies.
+    first_name_pos = len(data)
+    for name in _OP2_RESULT_TABLE_NAMES:
+        p = data.find(name)
+        if 0 < p < first_name_pos:
+            first_name_pos = p
+
+    if first_name_pos == len(data):
+        return b''   # no result table found in file
+
+    # Scan backwards from the table name to find the [4][-1][4] marker that
+    # opens this table.  It should be within ~200 bytes before the name.
+    search_from = max(0, first_name_pos - 256)
+    marker_pos = data.rfind(marker, search_from, first_name_pos)
+    if marker_pos == -1:
+        return b''
+
+    return data[:marker_pos]
 
 
 def write_msc_op2(table_specs: list, output_path: str, date=None,
