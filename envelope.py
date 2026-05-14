@@ -658,23 +658,21 @@ def write_msc_op2(table_specs: list, output_path: str, date=None) -> None:
 def write_output(env_max: dict, env_min: dict, templates: dict,
                  output_path: str, fmt: str,
                  nastran_format: str = 'msc',
-                 out_model=None,
-                 embed_geometry: bool = False) -> list:
+                 out_model=None) -> list:
     """Write envelope results to OP2 (all supported types) or HDF5.
 
     For fmt='op2':
-        If embed_geometry=True and out_model has geometry, uses pyNastran's
-        write_op2() so GEOM1/GEOM2/EPT/MPT tables are preserved (standalone OP2).
-        Otherwise uses raw struct.pack writer (HyperView-compatible, BDF+OP2 workflow).
+        If out_model has geometry (nodes loaded via load_geometry=True),
+        uses pyNastran's write_op2() so GEOM1/GEOM2/EPT/MPT tables are
+        preserved in the output. Otherwise falls back to raw struct.pack
+        writer for result tables only.
         Returns a list of attribute names NOT written to OP2.
 
     For fmt='h5':
         Writes all result types via pyNastran export_hdf5. Returns [].
     """
     if fmt == "op2":
-        has_geom = (embed_geometry
-                    and out_model is not None
-                    and bool(getattr(out_model, "nodes", {})))
+        has_geom = out_model is not None and bool(getattr(out_model, "nodes", {}))
         if has_geom:
             for attrs in RESULT_ATTRIBUTES.values():
                 for attr in attrs:
@@ -927,14 +925,6 @@ class LoadExtractionApp:
                          value="op2").pack(side="left", padx=4)
         ttk.Radiobutton(frm_fmt, text=".h5",  variable=self.sv_fmt,
                          value="h5").pack(side="left")
-        self.bv_geom = tk.BooleanVar(value=False)
-        self.cbtn_geom = ttk.Checkbutton(
-            frm_fmt,
-            text="Geometri gömülsün  (standalone OP2, BDF gerekmez)",
-            variable=self.bv_geom)
-        self.cbtn_geom.pack(side="left", padx=(12, 4))
-        self.sv_fmt.trace_add("write", lambda *_: self._toggle_geom())
-
         # ── Excel çıktısı ─────────────────────────────────────────────
         frm_xl = ttk.LabelFrame(
             self.root,
@@ -1057,13 +1047,6 @@ class LoadExtractionApp:
         self.ent_excel.configure(state=state)
         self.btn_xl_browse.configure(state=state)
 
-    def _toggle_geom(self):
-        if self.sv_fmt.get() == "op2":
-            self.cbtn_geom.config(state="normal")
-        else:
-            self.bv_geom.set(False)
-            self.cbtn_geom.config(state="disabled")
-
     # ── Checkable treeview ──────────────────────────────────────────────────
 
     def _toggle_check(self, event):
@@ -1161,17 +1144,15 @@ class LoadExtractionApp:
                 return
 
         fmt = self.sv_fmt.get()
-        embed_geom = self.bv_geom.get()
         self._clear_log()
         self._set_buttons("disabled")
         threading.Thread(
             target=self._worker_run,
-            args=(files, selected_types, output_path, fmt, excel_path, embed_geom),
+            args=(files, selected_types, output_path, fmt, excel_path),
             daemon=True,
         ).start()
 
-    def _worker_run(self, files, selected_types, output_path, fmt, excel_path,
-                    embed_geometry=False):
+    def _worker_run(self, files, selected_types, output_path, fmt, excel_path):
         timer = _ProgressTimer(self._log)
         try:
             self._log(f"Seçilen tipler: {', '.join(selected_types)}")
@@ -1194,8 +1175,7 @@ class LoadExtractionApp:
             self._log(f"Çıktı yazılıyor → {output_path}")
             not_in_op2 = write_output(
                 env_max, env_min, templates, output_path, fmt,
-                nastran_format=nastran_fmt, out_model=first_model,
-                embed_geometry=embed_geometry)
+                nastran_format=nastran_fmt, out_model=first_model)
 
             # For OP2 format: unsupported result types (solid stress, rod/bar/beam
             # stress, etc.) go to Excel automatically alongside all governing info.
