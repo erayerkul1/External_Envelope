@@ -355,6 +355,17 @@ _OP2_PLATE_STRESS_ATTRS = frozenset([
 _OP2_PLATE_FORCE_ATTRS = frozenset([
     'cquad4_force', 'ctria3_force',
 ])
+# Generic element results: rod/bar/beam/solid/spring/bush/gap (template.element or element_cid)
+_OP2_GENERIC_ELEMENT_ATTRS = frozenset([
+    'chexa_stress', 'ctetra_stress', 'cpenta_stress',
+    'chexa_strain', 'ctetra_strain', 'cpenta_strain',
+    'cbar_stress', 'cbar_strain', 'cbar_force',
+    'cbeam_stress', 'cbeam_strain', 'cbeam_force',
+    'crod_stress', 'conrod_stress', 'crod_strain', 'conrod_strain',
+    'crod_force', 'conrod_force', 'ctube_force',
+    'celas1_force', 'celas2_force', 'celas3_force', 'celas4_force',
+    'cbush_force', 'cgap_force',
+])
 # Centroid element types supported by _prep_plate_stress_data
 _CENTROID_ELEMENT_TYPES = frozenset([33, 74, 227, 228])
 
@@ -620,6 +631,78 @@ def _build_plate_force_spec(attr, template, env_data):
     }
 
 
+def _prep_generic_element_data(template, env_data):
+    """(data_bytes, ntotal) for any simple-element result.
+
+    Handles rod/bar/beam/solid/spring/bush/gap where element IDs come from
+    template.element (1-D) or template.element_cid[:, 0] (solid centroid).
+    num_wide is read from the template; data shape must be (N, num_wide-1).
+    """
+    if hasattr(template, 'element') and template.element is not None:
+        eids = np.asarray(template.element, dtype=np.int32).ravel()
+    elif hasattr(template, 'element_cid') and template.element_cid is not None:
+        eids = np.asarray(template.element_cid, dtype=np.int32)[:, 0]
+    else:
+        return None
+
+    nelements = len(eids)
+    num_wide = getattr(template, 'num_wide', None)
+    if not num_wide or num_wide < 2:
+        return None
+
+    data_f32 = np.asarray(env_data, dtype=np.float32)
+    if data_f32.ndim == 1:
+        data_f32 = data_f32.reshape(nelements, -1)
+    if data_f32.shape[0] != nelements:
+        return None
+
+    n_cols = num_wide - 1
+    if data_f32.shape[1] < n_cols:
+        return None
+    data_f32 = data_f32[:, :n_cols]
+
+    dev = int(getattr(template, 'device_code', 2) or 2)
+    eid_device = (eids * 10 + dev).astype(np.int32)
+
+    out = np.empty((nelements, num_wide), dtype=np.float32)
+    out[:, 0] = eid_device.view(np.float32)
+    out[:, 1:] = data_f32
+    return out.tobytes(), nelements * num_wide
+
+
+def _build_generic_element_spec(attr, template, env_data):
+    """Table spec for solid/bar/beam/rod/spring/bush/gap element results."""
+    prep = _prep_generic_element_data(template, env_data)
+    if prep is None:
+        return None
+    data_bytes, ntotal = prep
+    lsdvmns  = _get_lsdvmns(template)
+    approach = int(getattr(template, 'approach_code', 12) or 12)
+    tc       = int(getattr(template, 'table_code', 5) or 5)
+    etype    = int(getattr(template, 'element_type', 0) or 0)
+    ls       = int(getattr(template, 'load_set', 1) or 1)
+    s_code   = int(getattr(template, 's_code', 0))
+    thermal  = int(getattr(template, 'thermal', 0))
+    fmt_code = int(getattr(template, 'format_code', 1) or 1)
+    num_wide = int(getattr(template, 'num_wide', 2))
+    is_force = attr.endswith('_force')
+    tname = getattr(template, 'table_name', None) or ('OEF1X' if is_force else 'OES1X')
+    sub   = getattr(template, 'subtable_name', None) or (b'OEF1    ' if is_force else b'OES1    ')
+    if isinstance(sub, str):
+        sub = sub.encode('ascii')
+    return {
+        'table_name':    tname,
+        'subtable_name': sub,
+        'table3_words':  _t3_oes(approach, tc, etype, lsdvmns, lsdvmns, ls,
+                                  fmt_code, num_wide, s_code, thermal),
+        'data_bytes':    data_bytes,
+        'ntotal':        ntotal,
+        'title':    getattr(template, 'title',    '') or '',
+        'subtitle': getattr(template, 'subtitle', '') or '',
+        'label':    getattr(template, 'label',    '') or '',
+    }
+
+
 _OP2_RESULT_TABLE_NAMES = frozenset([
     b'OUGV1   ', b'OUG1    ', b'OES1X   ', b'OES1    ', b'OES1C   ',
     b'OEF1X   ', b'OEF1    ', b'OQG1    ', b'OQMG1   ', b'OGPFB1  ',
@@ -750,6 +833,8 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
                     spec = _build_plate_stress_spec(attr, template, max_arr)
                 elif attr in _OP2_PLATE_FORCE_ATTRS:
                     spec = _build_plate_force_spec(attr, template, max_arr)
+                elif attr in _OP2_GENERIC_ELEMENT_ATTRS:
+                    spec = _build_generic_element_spec(attr, template, max_arr)
                 else:
                     spec = None
             except Exception:
@@ -761,8 +846,7 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
         if not table_specs:
             raise RuntimeError(
                 "OP2 çıktısı için desteklenen result tipi bulunamadı.\n"
-                "Seçili tipler arasında displacements, spc_forces, plate_stress "
-                "veya plate_force olmalı."
+                "Seçili result tiplerinin desteklenen formatta olduğundan emin olun."
             )
 
         write_msc_op2(table_specs, output_path, geom_prefix=geom_prefix)
