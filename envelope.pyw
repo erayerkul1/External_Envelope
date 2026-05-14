@@ -620,12 +620,60 @@ def _build_plate_force_spec(attr, template, env_data):
     }
 
 
-def write_msc_op2(table_specs: list, output_path: str, date=None) -> None:
+_OP2_RESULT_TABLE_NAMES = frozenset([
+    b'OUGV1   ', b'OUG1    ', b'OES1X   ', b'OES1    ', b'OES1C   ',
+    b'OEF1X   ', b'OEF1    ', b'OQG1    ', b'OQMG1   ', b'OGPFB1  ',
+    b'OLOAD1  ', b'OUGV1PAT', b'OSTR1X  ', b'OEFIT   ', b'ONRGY1  ',
+    b'ONRGY2  ', b'OUGATO1 ', b'OUGCRM1 ', b'OUGPSD1 ', b'OUGRMS1 ',
+])
+
+
+def _extract_op2_geom_prefix(filepath: str) -> bytes:
+    """Return raw bytes of all non-result tables (geometry prefix) from an OP2.
+
+    Scans for [4][-1][4] (table-start marker) followed by a record whose
+    content contains a known result table name.  Everything before the first
+    such marker is the geometry prefix (NASTRAN header + GEOM1/GEOM2/EPT/MPT
+    tables written by Nastran, in their original binary format).
+    Returns b'' if parsing fails or no geometry prefix is found.
+    """
+    try:
+        with open(filepath, 'rb') as fh:
+            data = fh.read()
+    except OSError:
+        return b''
+
+    marker = _struct.pack('<3i', 4, -1, 4)   # little-endian [4][-1][4]
+    pos = 0
+    while True:
+        idx = data.find(marker, pos)
+        if idx == -1:
+            break
+        rec_start = idx + 12             # skip 12-byte marker → Fortran record
+        if rec_start + 8 > len(data):
+            break
+        rec_len = _struct.unpack_from('<i', data, rec_start)[0]
+        if 0 < rec_len <= len(data) - rec_start - 8:
+            content = data[rec_start + 4: rec_start + 4 + rec_len]
+            for name in _OP2_RESULT_TABLE_NAMES:
+                if name in content:
+                    return data[:idx]    # geometry prefix found
+        pos = idx + 1
+
+    return b''
+
+
+def write_msc_op2(table_specs: list, output_path: str, date=None,
+                  geom_prefix: bytes = b'') -> None:
     """Write multiple result tables to a single HyperView-compatible MSC Nastran OP2.
 
     Uses raw struct.pack so only the requested tables appear in the file —
     pyNastran's write_op2 emits extra tables (GPFORCE, OLOAD, …) that confuse
     HyperView's parser and cause "No results/supported Result Blocks found".
+
+    If geom_prefix is provided (raw bytes extracted from the source OP2 via
+    _extract_op2_geom_prefix), it is written first instead of a synthetic
+    NASTRAN file header, producing a standalone OP2 with embedded geometry.
 
     Each spec in table_specs:
         table_name   : str    8-char table name  (e.g. 'OUGV1', 'OES1X')
@@ -643,7 +691,10 @@ def write_msc_op2(table_specs: list, output_path: str, date=None) -> None:
     dyear = year - 2000
 
     with open(output_path, 'wb') as f:
-        f.write(_op2_file_header(month, day, dyear))
+        if geom_prefix:
+            f.write(geom_prefix)          # original NASTRAN header + GEOM tables
+        else:
+            f.write(_op2_file_header(month, day, dyear))
         for spec in table_specs:
             f.write(_op2_table_header_block(
                 spec['table_name'], spec['subtable_name'], month, day, dyear))
@@ -662,10 +713,11 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
     """Write envelope results to OP2 (all supported types) or HDF5.
 
     For fmt='op2':
-        If out_model has geometry (nodes loaded via load_geometry=True),
-        uses pyNastran's write_op2() so GEOM1/GEOM2/EPT/MPT tables are
-        preserved in the output. Otherwise falls back to raw struct.pack
-        writer for result tables only.
+        Always uses the raw struct.pack writer (HyperView-compatible).
+        If out_model has geometry and its source path is known, raw GEOM
+        table bytes from the input OP2 are prepended via
+        _extract_op2_geom_prefix(), producing a standalone OP2 that
+        HyperView can open without a BDF.
         Returns a list of attribute names NOT written to OP2.
 
     For fmt='h5':
@@ -673,28 +725,11 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
     """
     if fmt == "op2":
         has_geom = out_model is not None and bool(getattr(out_model, "nodes", {}))
+        geom_prefix = b''
         if has_geom:
-            for attrs in RESULT_ATTRIBUTES.values():
-                for attr in attrs:
-                    if getattr(out_model, attr, {}):
-                        setattr(out_model, attr, {})
-            for attr, max_arr in env_max.items():
-                template = templates.get(attr)
-                if template is None:
-                    continue
-                res_max = deepcopy(template)
-                res_max.data = max_arr[np.newaxis, :, :]
-                try:
-                    res_max.isubcase = 1
-                    if hasattr(res_max, "lsdvmns"):
-                        res_max.lsdvmns = np.array([1], dtype=res_max.lsdvmns.dtype)
-                    if hasattr(res_max, "dts"):
-                        res_max.dts = np.array([0.0], dtype=res_max.dts.dtype)
-                except Exception:
-                    pass
-                setattr(out_model, attr, {1: res_max})
-            out_model.write_op2(output_path, nastran_format=nastran_format)
-            return []
+            src = getattr(out_model, 'op2_filename', None)
+            if src:
+                geom_prefix = _extract_op2_geom_prefix(src)
 
         table_specs = []
         written: set = set()
@@ -725,7 +760,7 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
                 "veya plate_force olmalı."
             )
 
-        write_msc_op2(table_specs, output_path)
+        write_msc_op2(table_specs, output_path, geom_prefix=geom_prefix)
         not_written = [a for a in env_max if a not in written]
         return not_written
 
