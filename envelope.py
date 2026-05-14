@@ -1207,6 +1207,17 @@ class LoadExtractionApp:
 
             self._log(f"Bulunan attribute'lar: {list(env_max.keys())}")
 
+            has_geom = first_model is not None and bool(
+                getattr(first_model, 'nodes', {}))
+            if has_geom:
+                src = getattr(first_model, 'op2_filename', None)
+                self._log(
+                    f"Geometry bulundu — kaynak: {os.path.basename(src) if src else '?'}")
+            else:
+                self._log(
+                    "Geometry bulunamadı (input OP2'de GEOM tablosu yok — "
+                    "PARAM,POST,-1 gerekiyor). Çıktı sadece sonuçları içerecek.")
+
             self._log(f"Çıktı yazılıyor → {output_path}")
             not_in_op2 = write_output(
                 env_max, env_min, templates, output_path, fmt,
