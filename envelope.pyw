@@ -703,12 +703,14 @@ def _build_generic_element_spec(attr, template, env_data):
     }
 
 
-def _patch_spec_subcase(spec: dict, isubcase: int, title: str) -> dict:
-    """Return a copy of spec with isubcase/lsdvmns (TABLE3 words 3&4) and title overridden."""
+def _patch_spec_subcase(spec: dict, isubcase: int, label: str) -> dict:
+    """Return a copy of spec with isubcase/lsdvmns (TABLE3 words 3&4) and
+    title/subtitle/label all set to label so HyperView shows it clearly."""
     words = list(spec['table3_words'])
     words[3] = isubcase   # isubcase
     words[4] = isubcase   # lsdvmns
-    return {**spec, 'table3_words': words, 'title': title}
+    return {**spec, 'table3_words': words,
+            'title': label, 'subtitle': label, 'label': label}
 
 
 _OP2_RESULT_TABLE_NAMES = frozenset([
