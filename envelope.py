@@ -703,6 +703,14 @@ def _build_generic_element_spec(attr, template, env_data):
     }
 
 
+def _patch_spec_subcase(spec: dict, isubcase: int, title: str) -> dict:
+    """Return a copy of spec with isubcase/lsdvmns (TABLE3 words 3&4) and title overridden."""
+    words = list(spec['table3_words'])
+    words[3] = isubcase   # isubcase
+    words[4] = isubcase   # lsdvmns
+    return {**spec, 'table3_words': words, 'title': title}
+
+
 _OP2_RESULT_TABLE_NAMES = frozenset([
     b'OUGV1   ', b'OUG1    ', b'OES1X   ', b'OES1    ', b'OES1C   ',
     b'OEF1X   ', b'OEF1    ', b'OQG1    ', b'OQMG1   ', b'OGPFB1  ',
@@ -822,26 +830,36 @@ def write_output(env_max: dict, env_min: dict, templates: dict,
         table_specs = []
         written: set = set()
 
+        def _build_spec(attr, template, arr):
+            if attr in _OP2_NODAL_ATTRS:
+                return _build_nodal_spec(attr, template, arr)
+            elif attr in _OP2_PLATE_STRESS_ATTRS:
+                return _build_plate_stress_spec(attr, template, arr)
+            elif attr in _OP2_PLATE_FORCE_ATTRS:
+                return _build_plate_force_spec(attr, template, arr)
+            elif attr in _OP2_GENERIC_ELEMENT_ATTRS:
+                return _build_generic_element_spec(attr, template, arr)
+            return None
+
         for attr, max_arr in env_max.items():
             template = templates.get(attr)
             if template is None:
                 continue
+            min_arr = env_min.get(attr)
             try:
-                if attr in _OP2_NODAL_ATTRS:
-                    spec = _build_nodal_spec(attr, template, max_arr)
-                elif attr in _OP2_PLATE_STRESS_ATTRS:
-                    spec = _build_plate_stress_spec(attr, template, max_arr)
-                elif attr in _OP2_PLATE_FORCE_ATTRS:
-                    spec = _build_plate_force_spec(attr, template, max_arr)
-                elif attr in _OP2_GENERIC_ELEMENT_ATTRS:
-                    spec = _build_generic_element_spec(attr, template, max_arr)
-                else:
-                    spec = None
+                max_spec = _build_spec(attr, template, max_arr)
             except Exception:
-                spec = None
-            if spec is not None:
-                table_specs.append(spec)
+                max_spec = None
+            if max_spec is not None:
+                table_specs.append(_patch_spec_subcase(max_spec, 1, 'MAX ENVELOPE'))
                 written.add(attr)
+                if min_arr is not None:
+                    try:
+                        min_spec = _build_spec(attr, template, min_arr)
+                    except Exception:
+                        min_spec = None
+                    if min_spec is not None:
+                        table_specs.append(_patch_spec_subcase(min_spec, 2, 'MIN ENVELOPE'))
 
         if not table_specs:
             raise RuntimeError(
